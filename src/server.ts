@@ -1736,7 +1736,7 @@ function enforceShareAccessForConnections(note: NoteRecord) {
 
 function broadcastConfluencePush(note: NoteRecord, message: ServerConfluencePushMessage) {
   for (const conn of clients) {
-    if (conn.kind === "editor" && conn.noteId === note.id) {
+    if (isCollaborativeConn(conn, note.id)) {
       sendServerMessage(conn.ws, message);
     }
   }
@@ -1750,7 +1750,7 @@ function broadcastConfluenceMeta(note: NoteRecord) {
     confluence: publicConfluenceBinding(note)!,
   };
   for (const conn of clients) {
-    if (conn.kind === "editor" && conn.noteId === note.id) {
+    if (isCollaborativeConn(conn, note.id)) {
       sendServerMessage(conn.ws, message);
     }
   }
@@ -1764,7 +1764,7 @@ function broadcastConfluenceRefresh(note: NoteRecord) {
     pageId: note.confluence.pageId,
   };
   for (const conn of clients) {
-    if (conn.kind === "editor" && conn.noteId === note.id) {
+    if (isCollaborativeConn(conn, note.id)) {
       sendServerMessage(conn.ws, message);
     }
   }
@@ -1777,7 +1777,7 @@ function broadcastMarkerIds(note: NoteRecord) {
     markerCharKeys: [...note.markerIds],
   };
   for (const conn of clients) {
-    if (conn.kind === "editor" && conn.noteId === note.id) {
+    if (isCollaborativeConn(conn, note.id)) {
       sendServerMessage(conn.ws, message);
     }
   }
