@@ -50,7 +50,7 @@ export type ConfluenceBindingPublic = {
   lastKnownPublishedVersion: number;
   lastKnownDraftVersion: number | null;
   lastPushedAt: string | null;
-  lastPushStatus: "idle" | "pushing" | "pushed" | "conflict" | "error";
+  lastPushStatus: "idle" | "pushing" | "pushed" | "conflict" | "error" | "refreshing";
   lastPushError: string | null;
   agentEditsAllowed: boolean;
   agentCommentsAllowed: boolean;
@@ -74,7 +74,7 @@ export type ServerConfluencePushMessage = {
   type: "confluence-push";
   noteId: string;
   pageId: string;
-  status: "pushing" | "pushed" | "conflict" | "error";
+  status: "pushing" | "pushed" | "conflict" | "error" | "refreshing";
   oldVersion?: number;
   newVersion?: number;
   appliedCount?: number;

@@ -30,6 +30,8 @@ import {
   idBeforeIndex,
   idAtIndex,
   scanMarkerIds,
+  scanMarkerIdsDetailed,
+  type MarkerScan,
   validateMutationAgainstMarkers,
   buildVisibleProjection,
 } from "./collab.js";
@@ -90,7 +92,7 @@ type ConfluenceBinding = {
   lastKnownDraftVersion: number | null;
   lastPushedAt: string | null;
   lastPushedMarkdownSha256: string | null;
-  lastPushStatus: "idle" | "pushing" | "pushed" | "conflict" | "error";
+  lastPushStatus: "idle" | "pushing" | "pushed" | "conflict" | "error" | "refreshing";
   lastPushError: string | null;
   agentEditsAllowed: boolean;
   agentCommentsAllowed: boolean;
@@ -131,6 +133,7 @@ type NoteSummary = {
   updatedAt: string;
   shareId: string;
   snippet: string;
+  confluence: ConfluenceBindingPublic | null;
 };
 
 type DeviceToken = {
@@ -323,12 +326,20 @@ app.get("/api/keys", requireOwnerApi, (_req, res) => {
 });
 
 app.post("/api/keys", requireOwnerApi, (req, res) => {
+  if (!isOwnerSession(req)) {
+    res.status(403).json({ ok: false, error: "owner-cookie-required" });
+    return;
+  }
   const label = String(req.body.label || "unnamed");
   const result = createApiKey(label);
   res.json({ ok: true, ...result });
 });
 
 app.delete("/api/keys/:id", requireOwnerApi, (req, res) => {
+  if (!isOwnerSession(req)) {
+    res.status(403).json({ ok: false, error: "owner-cookie-required" });
+    return;
+  }
   const deleted = deleteApiKey(String(req.params.id));
   if (!deleted) {
     res.status(404).json({ ok: false, error: "API key not found." });
@@ -346,6 +357,11 @@ app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
 
   if (note.confluence && !isOwnerSession(req) && !note.confluence.agentEditsAllowed) {
     res.status(403).json({ ok: false, error: "agent-edits-disabled" });
+    return;
+  }
+
+  if (note.confluence && note.confluence.lastPushStatus === "refreshing") {
+    res.status(409).json({ ok: false, error: "refresh-in-progress" });
     return;
   }
 
@@ -403,13 +419,37 @@ type HttpEditsResult =
     }
   | { ok: false; status: number; body: Record<string, unknown> };
 
+type HttpEditErrorDetail =
+  | { index: number; code: "old-text-empty" }
+  | { index: number; code: "old-text-not-found" }
+  | { index: number; code: "old-text-ambiguous"; count: number };
+
+// Reconstruct the literal `<!-- @path:... -->` text for the run that contains
+// the supplied charKey. Used to enrich marker-conflict 409 responses so agents
+// don't get an opaque charKey.
+function resolveMarkerText(state: CollabState, scan: MarkerScan, markerCharKey: string): string {
+  const runId = scan.runIds.get(markerCharKey);
+  if (runId === undefined) return "";
+  const parts: string[] = [];
+  for (const id of state.idList.values()) {
+    const k = `${id.bunchId}:${id.counter}`;
+    if (scan.runIds.get(k) === runId) {
+      const ch = state.chars.get(k);
+      if (ch !== undefined) parts.push(ch);
+    }
+  }
+  return parts.join("");
+}
+
 function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
   let workingCollab = note.collab;
   let markdown = note.markdown;
   let senderCounter = 0;
   const errors: string[] = [];
+  const errorDetails: HttpEditErrorDetail[] = [];
   const idListUpdates: ServerMutationMessage["idListUpdates"] = [];
-  let workingMarkerIds = new Set(note.markerIds);
+  let workingMarkerScan: MarkerScan = scanMarkerIdsDetailed(workingCollab);
+  let workingMarkerIds = workingMarkerScan.charKeys;
   const isConfluenceBound = Boolean(note.confluence);
   let projection = isConfluenceBound
     ? buildVisibleProjection(workingCollab, workingMarkerIds)
@@ -422,6 +462,7 @@ function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
 
     if (!oldText) {
       errors.push(`Edit ${i}: oldText is empty.`);
+      errorDetails.push({ index: i, code: "old-text-empty" });
       continue;
     }
 
@@ -434,12 +475,15 @@ function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
     const firstVisibleIndex = haystack.indexOf(oldText);
     if (firstVisibleIndex === -1) {
       errors.push(`Edit ${i}: oldText not found.`);
+      errorDetails.push({ index: i, code: "old-text-not-found" });
       continue;
     }
 
     const secondVisibleIndex = haystack.indexOf(oldText, firstVisibleIndex + 1);
     if (secondVisibleIndex !== -1) {
-      errors.push(`Edit ${i}: oldText is ambiguous (found ${countOccurrences(haystack, oldText)} times).`);
+      const count = countOccurrences(haystack, oldText);
+      errors.push(`Edit ${i}: oldText is ambiguous (found ${count} times).`);
+      errorDetails.push({ index: i, code: "old-text-ambiguous", count });
       continue;
     }
 
@@ -450,6 +494,66 @@ function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
     const lastIndex = projection
       ? projection.visibleToAnnotated[lastVisibleIndex]
       : lastVisibleIndex;
+
+    // C2: cross-marker oldText whole-run delete guard. Agents read the visible
+    // projection (markers stripped); their oldText can therefore span content
+    // either side of an entire marker run. The validator allows whole-run
+    // deletes (so explicit user gestures like backspacing the whole region
+    // still work), but here we know the delete was synthesized from oldText
+    // — the agent never saw the marker. Reject any fully-contained run.
+    if (isConfluenceBound && workingMarkerScan.charKeys.size > 0 && oldText.length > 0) {
+      const runFirstIndexByRunId = new Map<number, number>();
+      const runLastIndexByRunId = new Map<number, number>();
+      // Index marker positions in the annotated buffer once so we can ask
+      // "for this runId, where does the run start/end in annotated indices".
+      let annotatedIdx = 0;
+      for (const id of workingCollab.idList.values()) {
+        const k = `${id.bunchId}:${id.counter}`;
+        const runId = workingMarkerScan.runIds.get(k);
+        if (runId !== undefined) {
+          if (!runFirstIndexByRunId.has(runId)) {
+            runFirstIndexByRunId.set(runId, annotatedIdx);
+          }
+          runLastIndexByRunId.set(runId, annotatedIdx);
+        }
+        annotatedIdx++;
+      }
+      const seenRuns = new Set<number>();
+      let engulfedKey: string | null = null;
+      const idsArr: { bunchId: string; counter: number }[] = [];
+      for (const id of workingCollab.idList.values()) idsArr.push(id);
+      for (let idx = firstIndex; idx <= lastIndex; idx++) {
+        const id = idsArr[idx];
+        if (!id) continue;
+        const k = `${id.bunchId}:${id.counter}`;
+        const runId = workingMarkerScan.runIds.get(k);
+        if (runId === undefined) continue;
+        if (seenRuns.has(runId)) continue;
+        seenRuns.add(runId);
+        const runFirst = runFirstIndexByRunId.get(runId)!;
+        const runLast = runLastIndexByRunId.get(runId)!;
+        if (runFirst >= firstIndex && runLast <= lastIndex) {
+          // Fully contained.
+          const firstId = idsArr[runFirst];
+          engulfedKey = `${firstId.bunchId}:${firstId.counter}`;
+          break;
+        }
+      }
+      if (engulfedKey) {
+        return {
+          ok: false,
+          status: 409,
+          body: {
+            ok: false,
+            error: "marker-conflict",
+            reason: "delete-engulfs-marker",
+            markerCharKey: engulfedKey,
+            markerText: resolveMarkerText(workingCollab, workingMarkerScan, engulfedKey),
+            editIndex: i,
+          },
+        };
+      }
+    }
 
     let nextClientCounter = senderCounter + 1;
     const mutations: ClientMutation[] = [];
@@ -481,8 +585,9 @@ function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
 
     if (isConfluenceBound && workingMarkerIds.size > 0) {
       for (const mutation of mutations) {
-        const verdict = validateMutationAgainstMarkers(workingCollab, mutation, workingMarkerIds);
+        const verdict = validateMutationAgainstMarkers(workingCollab, mutation, workingMarkerScan);
         if (!verdict.ok) {
+          const markerKey = verdict.markerCharKey || null;
           return {
             ok: false,
             status: 409,
@@ -490,7 +595,8 @@ function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
               ok: false,
               error: "marker-conflict",
               reason: verdict.reason,
-              markerCharKey: verdict.markerCharKey || null,
+              markerCharKey: markerKey,
+              markerText: markerKey ? resolveMarkerText(workingCollab, workingMarkerScan, markerKey) : "",
               editIndex: i,
             },
           };
@@ -505,13 +611,14 @@ function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
     senderCounter = mutations.at(-1)?.clientCounter || senderCounter;
 
     if (isConfluenceBound) {
-      workingMarkerIds = scanMarkerIds(workingCollab);
+      workingMarkerScan = scanMarkerIdsDetailed(workingCollab);
+      workingMarkerIds = workingMarkerScan.charKeys;
       projection = buildVisibleProjection(workingCollab, workingMarkerIds);
     }
   }
 
   if (errors.length > 0) {
-    return { ok: false, status: 400, body: { ok: false, errors } };
+    return { ok: false, status: 400, body: { ok: false, error: "edit-failed", errors, details: errorDetails } };
   }
 
   return { ok: true, workingCollab, markdown, senderCounter, idListUpdates };
@@ -648,6 +755,10 @@ app.patch("/api/notes/:id/threads/:threadId", requireOwnerApi, (req, res) => {
 app.delete("/api/notes/:id/threads/:threadId", requireOwnerApi, (req, res) => {
   const note = notes.get(String(req.params.id));
   if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
+    return;
+  }
   note.threads = note.threads.filter((t) => t.id !== String(req.params.threadId));
   note.updatedAt = nowIso();
   persistNote(note);
@@ -658,6 +769,10 @@ app.delete("/api/notes/:id/threads/:threadId", requireOwnerApi, (req, res) => {
 app.patch("/api/notes/:id/messages/:messageId", requireOwnerApi, (req, res) => {
   const note = notes.get(String(req.params.id));
   if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
+    return;
+  }
   const located = locateMessage(note, String(req.params.messageId));
   if (!located) { res.status(404).json({ ok: false, error: "Message not found." }); return; }
   const body = normalizeCommentBody(String(req.body.body || ""));
@@ -674,6 +789,10 @@ app.patch("/api/notes/:id/messages/:messageId", requireOwnerApi, (req, res) => {
 app.delete("/api/notes/:id/messages/:messageId", requireOwnerApi, (req, res) => {
   const note = notes.get(String(req.params.id));
   if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
+    return;
+  }
   const located = locateMessage(note, String(req.params.messageId));
   if (!located) { res.status(404).json({ ok: false, error: "Message not found." }); return; }
   located.thread.messages = located.thread.messages.filter((m) => m.id !== located.message.id);
@@ -693,6 +812,14 @@ app.delete("/api/notes/:id", requireOwnerApi, (req, res) => {
   const note = notes.get(id);
   if (!note) {
     res.status(404).json({ ok: false, error: "Note not found." });
+    return;
+  }
+
+  // Confluence-bound notes can only be deleted via owner cookie session — the
+  // binding represents a Confluence relationship the human should sever
+  // deliberately. An agent API key cannot wipe a binding.
+  if (note.confluence && !isOwnerSession(req)) {
+    res.status(403).json({ ok: false, error: "owner-only" });
     return;
   }
 
@@ -779,6 +906,60 @@ app.put("/api/notes/:id", requireOwnerApi, (req, res) => {
 
   const shareAccessChanged = nextShareAccess !== note.shareAccess;
 
+  // For Confluence-bound notes, a wholesale markdown replace is dangerous: it
+  // wipes the marker layer and the IdList, severing the binding's ability to
+  // detect partial-overlap deletes. Gate on agentEditsAllowed and validate
+  // marker survival.
+  if (note.confluence && markdownProvided) {
+    if (!isOwnerSession(req) && !note.confluence.agentEditsAllowed) {
+      res.status(403).json({ ok: false, error: "agent-edits-disabled" });
+      return;
+    }
+    const previousRunCount = (() => {
+      const seen = new Set<number>();
+      const scan = scanMarkerIdsDetailed(note.collab);
+      for (const v of scan.runIds.values()) seen.add(v);
+      return seen.size;
+    })();
+    // Tentatively build the next collab to inspect marker count; only commit
+    // below after the count check passes.
+    const candidateCollab = collabFromMarkdown(nextMarkdown, note.collab.serverCounter + 1);
+    const candidateRunCount = (() => {
+      const seen = new Set<number>();
+      const scan = scanMarkerIdsDetailed(candidateCollab);
+      for (const v of scan.runIds.values()) seen.add(v);
+      return seen.size;
+    })();
+    if (candidateRunCount < previousRunCount) {
+      res.status(409).json({
+        ok: false,
+        error: "marker-count-decreased",
+        previousRunCount,
+        candidateRunCount,
+      });
+      return;
+    }
+
+    note.title = nextTitle;
+    note.shareAccess = nextShareAccess;
+    if (markdownChanged) {
+      note.collab = candidateCollab;
+      note.markdown = nextMarkdown;
+    }
+    note.updatedAt = nowIso();
+    recomputeMarkerIds(note);
+    persistNote(note, false);
+    if (shareAccessChanged) {
+      enforceShareAccessForConnections(note);
+    }
+    if (titleChanged || markdownChanged || shareAccessChanged) {
+      broadcastEditorHello(note);
+      broadcastNoteUpdate(note);
+    }
+    res.json({ ok: true, savedAt: note.updatedAt, shareAccess: note.shareAccess });
+    return;
+  }
+
   note.title = nextTitle;
   note.shareAccess = nextShareAccess;
   if (markdownChanged) {
@@ -841,6 +1022,11 @@ app.post("/api/share/:shareId/edit", (req, res) => {
 
   if (note.confluence && !isOwnerSession(req) && !note.confluence.agentEditsAllowed) {
     res.status(403).json({ ok: false, error: "agent-edits-disabled" });
+    return;
+  }
+
+  if (note.confluence && note.confluence.lastPushStatus === "refreshing") {
+    res.status(409).json({ ok: false, error: "refresh-in-progress" });
     return;
   }
 
@@ -1041,6 +1227,11 @@ app.patch("/api/share/:shareId/threads/:threadId", (req, res) => {
   const note = requireShareAccess(req, res, "comment");
   if (!note) return;
 
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
+    return;
+  }
+
   const thread = note.threads.find((item) => item.id === String(req.params.threadId));
   if (!thread) {
     res.status(404).json({ ok: false, error: "Thread not found." });
@@ -1064,6 +1255,11 @@ app.delete("/api/share/:shareId/threads/:threadId", (req, res) => {
   const note = requireShareAccess(req, res, "comment");
   if (!note) return;
 
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
+    return;
+  }
+
   const thread = note.threads.find((item) => item.id === String(req.params.threadId));
   if (!thread) {
     res.status(404).json({ ok: false, error: "Thread not found." });
@@ -1085,6 +1281,11 @@ app.delete("/api/share/:shareId/threads/:threadId", (req, res) => {
 app.patch("/api/share/:shareId/messages/:messageId", (req, res) => {
   const note = requireShareAccess(req, res, "comment");
   if (!note) return;
+
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
+    return;
+  }
 
   const located = locateMessage(note, String(req.params.messageId));
   if (!located) {
@@ -1115,6 +1316,11 @@ app.patch("/api/share/:shareId/messages/:messageId", (req, res) => {
 app.delete("/api/share/:shareId/messages/:messageId", (req, res) => {
   const note = requireShareAccess(req, res, "comment");
   if (!note) return;
+
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
+    return;
+  }
 
   const located = locateMessage(note, String(req.params.messageId));
   if (!located) {
@@ -1160,6 +1366,10 @@ app.post("/api/notes/confluence/import", requireOwnerApi, async (req, res) => {
   const pageId = String(req.body?.pageId || "").trim();
   if (!pageId) {
     res.status(400).json({ ok: false, error: "pageId is required" });
+    return;
+  }
+  if (!/^[0-9]+$/.test(pageId)) {
+    res.status(400).json({ ok: false, error: "invalid-page-id" });
     return;
   }
 
@@ -1232,10 +1442,22 @@ app.get("/api/notes/:id/confluence/status", requireOwnerApi, (req, res) => {
   res.json({ ok: true, confluence: publicConfluenceBinding(note) });
 });
 
+app.get("/api/share/:shareId/confluence/status", (req, res) => {
+  const note = requireShareAccess(req, res, "view");
+  if (!note) return;
+  if (!note.confluence) { res.status(404).json({ ok: false, error: "not-confluence-bound" }); return; }
+  res.json({ ok: true, confluence: publicConfluenceBinding(note) });
+});
+
 app.patch("/api/notes/:id/confluence", requireOwnerApi, (req, res) => {
   const note = notes.get(String(req.params.id));
   if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
   if (!note.confluence) { res.status(404).json({ ok: false, error: "not-confluence-bound" }); return; }
+
+  const before = {
+    agentEditsAllowed: note.confluence.agentEditsAllowed,
+    agentCommentsAllowed: note.confluence.agentCommentsAllowed,
+  };
 
   const body = (req.body || {}) as Record<string, unknown>;
   let changed = false;
@@ -1268,6 +1490,18 @@ app.patch("/api/notes/:id/confluence", requireOwnerApi, (req, res) => {
     persistNote(note, false);
     broadcastConfluenceMeta(note);
   }
+
+  // C6: if agentEditsAllowed flipped from true to false, close any live
+  // public-editor (share-link "edit") WS connections for this note. Comment
+  // viewers (public-viewer) don't write, so we leave them open.
+  if (before.agentEditsAllowed && !note.confluence.agentEditsAllowed) {
+    for (const conn of [...clients]) {
+      if (conn.kind === "public-editor" && conn.noteId === note.id) {
+        try { conn.ws.close(); } catch {}
+      }
+    }
+  }
+
   res.json({ ok: true, confluence: publicConfluenceBinding(note) });
 });
 
@@ -1385,8 +1619,43 @@ app.post("/api/notes/:id/confluence/refresh", requireOwnerApi, async (req, res) 
     return;
   }
 
+  // Capture the pre-await sha so we can detect WS edits that arrived during
+  // the (potentially long) renderAnnotated call. Pre-mark the binding as
+  // "refreshing" so handleEditorMessage bounces incoming mutations.
+  const preAwaitSha = currentSha;
+  const previousStatus = binding.lastPushStatus;
+  binding.lastPushStatus = "refreshing";
+  binding.lastPushError = null;
+  persistNote(note, false);
+  broadcastConfluenceMeta(note);
+
   try {
     const rendered = await renderAnnotated(binding.pageId);
+
+    // I8: force-refresh snapshot — record the about-to-be-discarded buffer.
+    const postAwaitSha = sha256(note.markdown);
+    if (!force && binding.lastPushedMarkdownSha256 !== null && postAwaitSha !== preAwaitSha) {
+      // Local edits arrived while we were rendering. Abort and reset status.
+      binding.lastPushStatus = previousStatus;
+      persistNote(note, false);
+      broadcastConfluenceMeta(note);
+      res.status(409).json({ ok: false, error: "local-edits-would-be-lost", reason: "race-during-render" });
+      return;
+    }
+    if (force && postAwaitSha !== binding.lastPushedMarkdownSha256) {
+      try {
+        const snapshotDir = path.join(dataDir, "snapshots");
+        fs.mkdirSync(snapshotDir, { recursive: true });
+        const snapshotPath = path.join(snapshotDir, `${note.id}-${Date.now()}.md`);
+        try { fs.writeFileSync(snapshotPath, note.markdown, "utf8"); } catch {}
+        appendConfluenceHistory(note, {
+          by: describeAuthIdentity(req),
+          action: "refresh-discarded-edits",
+          details: { snapshotPath, sha: postAwaitSha },
+        });
+      } catch {}
+    }
+
     let draft;
     try { draft = await hasDraft(binding.pageId); } catch { draft = { exists: false, publishedVersion: rendered.version, draftVersion: null, title: rendered.title }; }
 
@@ -1413,9 +1682,14 @@ app.post("/api/notes/:id/confluence/refresh", requireOwnerApi, async (req, res) 
     persistNote(note, false);
     broadcastEditorHello(note);
     broadcastConfluenceRefresh(note);
+    broadcastConfluenceMeta(note);
     broadcastNoteUpdate(note);
     res.json({ ok: true, confluence: publicConfluenceBinding(note) });
   } catch (error) {
+    binding.lastPushStatus = previousStatus;
+    binding.lastPushError = error instanceof Error ? error.message : String(error);
+    persistNote(note, false);
+    broadcastConfluenceMeta(note);
     res.status(502).json({
       ok: false,
       error: "refresh-failed",
@@ -1513,6 +1787,14 @@ wss.on("connection", (ws, req) => {
       const color = CURSOR_COLORS[nextColorIndex++ % CURSOR_COLORS.length];
       const conn: ClientConn = { ws, kind: "public-editor", noteId: note.id, shareId: note.shareId, clientId, name: commenterName || "Anonymous", color, alive: true };
       clients.push(conn);
+      // Note: for Confluence-bound notes, share-link edit guests receive the
+      // annotated markdown and the full markerCharKeys array. This isn't a
+      // privacy boundary — it's a structural one. The IdList is shared across
+      // all clients; sending the visible projection without also stripping
+      // IdList entries would make every offset translation wrong on the
+      // client. Marker positions are needed so the client can hide them
+      // visually (textarea-marker-hiding work, future). Treat as "structurally
+      // visible, visually hidden" rather than "secret".
       sendServerMessage(ws, { ...buildHelloMessage(note), clientId });
       sendExistingPresence(conn);
 
@@ -1581,13 +1863,39 @@ function handleEditorMessage(conn: ClientConn, data: string) {
     return;
   }
 
+  // C3: bounce mutations during a refresh window. The HTTP refresh handler
+  // marks lastPushStatus = "refreshing" before awaiting the Confluence render
+  // round-trip. Mutations that arrive in that window would be silently lost
+  // by the post-await swap, so we resync the client back to the canonical
+  // state and don't ack their counters.
+  if (note.confluence && note.confluence.lastPushStatus === "refreshing") {
+    sendServerMessage(conn.ws, { ...buildHelloMessage(note), clientId: conn.clientId });
+    return;
+  }
+
+  // C6: belt-and-suspenders gate for public-editor connections on Confluence-
+  // bound notes whose agentEditsAllowed has been flipped off. The PATCH
+  // handler closes existing connections, but a connection that was open at
+  // toggle time and hasn't yet observed the close still gets rejected here.
+  if (
+    conn.kind === "public-editor" &&
+    note.confluence &&
+    !note.confluence.agentEditsAllowed
+  ) {
+    sendServerMessage(conn.ws, { ...buildHelloMessage(note), clientId: conn.clientId });
+    return;
+  }
+
   const senderCounter = mutationMsg.mutations.at(-1)?.clientCounter || 0;
   const lastAcknowledgedCounter = note.clientAcks.get(mutationMsg.clientId) || 0;
   const freshMutations = mutationMsg.mutations.filter((mutation) => mutation.clientCounter > lastAcknowledgedCounter);
 
   if (note.confluence && note.markerIds.size > 0) {
+    // Cache the detailed scan once per message; the validator needs run ids
+    // to correctly classify boundary inserts between two adjacent marker runs.
+    const markerScan = scanMarkerIdsDetailed(note.collab);
     for (const mutation of freshMutations) {
-      const verdict = validateMutationAgainstMarkers(note.collab, mutation, note.markerIds);
+      const verdict = validateMutationAgainstMarkers(note.collab, mutation, markerScan);
       if (!verdict.ok) {
         // Reject by replaying the canonical state to this client. We do not
         // ack the bad clientCounters, so the client will resync.
@@ -1893,6 +2201,13 @@ function loadNotesIntoMemory() {
         confluence.lastPushStatus = "error";
         confluence.lastPushError = "interrupted: server restarted while pushing";
       }
+      // Same recovery for a crash mid-refresh: lastPushStatus = "refreshing"
+      // is staged before the await; a stale value on disk means the previous
+      // process never finished the swap.
+      if (confluence.lastPushStatus === "refreshing") {
+        confluence.lastPushStatus = "idle";
+        confluence.lastPushError = "interrupted: server restarted while refreshing";
+      }
     }
 
     const note: NoteRecord = {
@@ -1907,6 +2222,14 @@ function loadNotesIntoMemory() {
     };
     notes.set(id, note);
   }
+}
+
+function truncateHistoryPreservingHead(history: ConfluenceHistoryEntry[]): ConfluenceHistoryEntry[] {
+  if (history.length <= 200) return history.slice();
+  const head = history.length > 0 ? [history[0]] : [];
+  const tailLen = Math.max(0, 200 - head.length);
+  const tail = history.slice(-tailLen);
+  return [...head, ...tail];
 }
 
 function normalizeConfluenceBinding(input: ConfluenceBinding): ConfluenceBinding {
@@ -1925,7 +2248,7 @@ function normalizeConfluenceBinding(input: ConfluenceBinding): ConfluenceBinding
     lastPushError: input.lastPushError ?? null,
     agentEditsAllowed: Boolean(input.agentEditsAllowed),
     agentCommentsAllowed: Boolean(input.agentCommentsAllowed),
-    history: Array.isArray(input.history) ? input.history.slice(-200) : [],
+    history: Array.isArray(input.history) ? truncateHistoryPreservingHead(input.history) : [],
   };
 }
 
@@ -1946,7 +2269,15 @@ function readJson<T>(filePath: string, fallback: T) {
 }
 
 function writeJson(filePath: string, value: unknown) {
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  atomicWriteFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+// Atomic write: stage to a tempfile in the same directory, then rename. Avoids
+// half-written files on crash mid-write (the rename is a single fs syscall).
+function atomicWriteFileSync(filePath: string, content: string) {
+  const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  fs.writeFileSync(tmp, content, "utf8");
+  fs.renameSync(tmp, filePath);
 }
 
 function createNote() {
@@ -1986,7 +2317,7 @@ function persistNote(note: NoteRecord, broadcastUpdate = true) {
     confluence: note.confluence,
   };
 
-  fs.writeFileSync(noteMarkdownPath(note.id), note.markdown, "utf8");
+  atomicWriteFileSync(noteMarkdownPath(note.id), note.markdown);
   writeJson(noteMetaPath(note.id), meta);
   if (broadcastUpdate) {
     broadcastNoteUpdate(note);
@@ -2058,7 +2389,18 @@ function appendConfluenceHistory(
   entry: Omit<ConfluenceHistoryEntry, "at">,
 ) {
   if (!note.confluence) return;
-  note.confluence.history = [...note.confluence.history, { at: nowIso(), ...entry }].slice(-200);
+  const newEntry: ConfluenceHistoryEntry = { at: nowIso(), ...entry };
+  const existing = note.confluence.history;
+  if (existing.length < 200) {
+    note.confluence.history = [...existing, newEntry];
+    return;
+  }
+  // Pin the first entry (typically the import event) so long-lived notes
+  // retain their provenance even after 200 events.
+  const head = existing.length > 0 ? [existing[0]] : [];
+  const tailLen = Math.max(0, 200 - head.length - 1);
+  const tail = existing.slice(-tailLen);
+  note.confluence.history = [...head, ...tail, newEntry];
 }
 
 function describeAuthIdentity(req: Request): string {
@@ -2094,6 +2436,7 @@ function summarizeNote(note: NoteRecord, needle: string): NoteSummary {
     updatedAt: note.updatedAt,
     shareId: note.shareId,
     snippet: buildSnippet(note, needle),
+    confluence: publicConfluenceBinding(note) ?? null,
   };
 }
 
