@@ -238,6 +238,30 @@ export function scanMarkerIds(state: CollabState): Set<string> {
   return result;
 }
 
+// Build the marker-stripped visible projection together with a mapping from
+// visible-string offsets back to annotated-buffer offsets (the index space
+// used by the IdList). Used by HTTP /edit to match agent-supplied oldText
+// against the same view the agent reads via GET /api/notes/:id.
+export function buildVisibleProjection(
+  state: CollabState,
+  markerIds: Set<string>,
+): { visible: string; visibleToAnnotated: number[] } {
+  const visibleChars: string[] = [];
+  const visibleToAnnotated: number[] = [];
+  let annotatedIdx = 0;
+  for (const id of state.idList.values()) {
+    const ch = state.chars.get(`${id.bunchId}:${id.counter}`);
+    if (ch !== undefined) {
+      if (!markerIds.has(`${id.bunchId}:${id.counter}`)) {
+        visibleChars.push(ch);
+        visibleToAnnotated.push(annotatedIdx);
+      }
+    }
+    annotatedIdx++;
+  }
+  return { visible: visibleChars.join(""), visibleToAnnotated };
+}
+
 export const MARKER_OPEN_LITERAL = "<!-- @path:";
 
 export type MarkerValidationResult =

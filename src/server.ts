@@ -31,6 +31,7 @@ import {
   idAtIndex,
   scanMarkerIds,
   validateMutationAgainstMarkers,
+  buildVisibleProjection,
 } from "./collab.js";
 import {
   applyAnnotated,
@@ -410,6 +411,9 @@ function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
   const idListUpdates: ServerMutationMessage["idListUpdates"] = [];
   let workingMarkerIds = new Set(note.markerIds);
   const isConfluenceBound = Boolean(note.confluence);
+  let projection = isConfluenceBound
+    ? buildVisibleProjection(workingCollab, workingMarkerIds)
+    : null;
 
   for (let i = 0; i < edits.length; i++) {
     const edit = edits[i] as { oldText?: unknown; newText?: unknown } | undefined;
@@ -421,17 +425,31 @@ function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
       continue;
     }
 
-    const firstIndex = markdown.indexOf(oldText);
-    if (firstIndex === -1) {
+    // For Confluence-bound notes, match against the visible projection so
+    // agents — which read the marker-stripped projection — can author edits
+    // whose oldText spans content that the annotated buffer interleaves with
+    // <!-- @path:... --> marker lines. Translate the visible-offset hit back
+    // to an annotated-offset for the IdList lookups.
+    const haystack = projection ? projection.visible : markdown;
+    const firstVisibleIndex = haystack.indexOf(oldText);
+    if (firstVisibleIndex === -1) {
       errors.push(`Edit ${i}: oldText not found.`);
       continue;
     }
 
-    const secondIndex = markdown.indexOf(oldText, firstIndex + 1);
-    if (secondIndex !== -1) {
-      errors.push(`Edit ${i}: oldText is ambiguous (found ${countOccurrences(markdown, oldText)} times).`);
+    const secondVisibleIndex = haystack.indexOf(oldText, firstVisibleIndex + 1);
+    if (secondVisibleIndex !== -1) {
+      errors.push(`Edit ${i}: oldText is ambiguous (found ${countOccurrences(haystack, oldText)} times).`);
       continue;
     }
+
+    const firstIndex = projection
+      ? projection.visibleToAnnotated[firstVisibleIndex]
+      : firstVisibleIndex;
+    const lastVisibleIndex = firstVisibleIndex + oldText.length - 1;
+    const lastIndex = projection
+      ? projection.visibleToAnnotated[lastVisibleIndex]
+      : lastVisibleIndex;
 
     let nextClientCounter = senderCounter + 1;
     const mutations: ClientMutation[] = [];
@@ -442,8 +460,8 @@ function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
         clientCounter: nextClientCounter++,
         args: {
           startId: idAtIndex(workingCollab, firstIndex),
-          endId: idAtIndex(workingCollab, firstIndex + oldText.length - 1),
-          contentLength: oldText.length,
+          endId: idAtIndex(workingCollab, lastIndex),
+          contentLength: lastIndex - firstIndex + 1,
         },
       });
     }
@@ -488,6 +506,7 @@ function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
 
     if (isConfluenceBound) {
       workingMarkerIds = scanMarkerIds(workingCollab);
+      projection = buildVisibleProjection(workingCollab, workingMarkerIds);
     }
   }
 
