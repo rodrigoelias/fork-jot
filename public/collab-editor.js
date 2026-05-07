@@ -389,6 +389,10 @@ export function createCollabEditor(textarea, opts) {
     if (it === "insertText" || it === "insertReplacementText" || it === "insertFromPaste" || it === "insertFromDrop") {
       const c = readInsertText(event); if (!c) return;
       event.preventDefault();
+      if (markerKeys.size > 0 && c.includes("<!-- @path:")) {
+        opts.onMarkerGuard?.({ kind: "paste-marker" });
+        return;
+      }
       pushIns(sel.start, c); sel = { start: sel.start + c.length, end: sel.start + c.length, direction: "none" };
       applyLocalMutations(mutations, sel); return;
     }
@@ -399,12 +403,48 @@ export function createCollabEditor(textarea, opts) {
     }
     if (it === "deleteContentBackward") {
       event.preventDefault();
-      if (!hasSel && ss > 0) { pushDel(ss - 1, ss); sel = { start: ss - 1, end: ss - 1, direction: "none" }; }
+      if (!hasSel && ss > 0) {
+        let delStart = ss - 1;
+        let delEnd = ss;
+        if (markerKeys.size > 0) {
+          // If the char being deleted is in a marker run, extend backwards to
+          // the start of the run.
+          const idAtDel = currentState.idList.at(delStart);
+          const keyAtDel = `${idAtDel.bunchId}:${idAtDel.counter}`;
+          if (markerKeys.has(keyAtDel)) {
+            while (delStart > 0) {
+              const prevId = currentState.idList.at(delStart - 1);
+              const prevKey = `${prevId.bunchId}:${prevId.counter}`;
+              if (!markerKeys.has(prevKey)) break;
+              delStart--;
+            }
+          }
+        }
+        pushDel(delStart, delEnd);
+        sel = { start: delStart, end: delStart, direction: "none" };
+      }
       applyLocalMutations(mutations, sel); return;
     }
     if (it === "deleteContentForward") {
       event.preventDefault();
-      if (!hasSel && ss < currentState.text.length) { pushDel(ss, ss + 1); sel = { start: ss, end: ss, direction: "none" }; }
+      if (!hasSel && ss < currentState.text.length) {
+        let delStart = ss;
+        let delEnd = ss + 1;
+        if (markerKeys.size > 0) {
+          const idAtDel = currentState.idList.at(delStart);
+          const keyAtDel = `${idAtDel.bunchId}:${idAtDel.counter}`;
+          if (markerKeys.has(keyAtDel)) {
+            while (delEnd < currentState.idList.length) {
+              const nextId = currentState.idList.at(delEnd);
+              const nextKey = `${nextId.bunchId}:${nextId.counter}`;
+              if (!markerKeys.has(nextKey)) break;
+              delEnd++;
+            }
+          }
+        }
+        pushDel(delStart, delEnd);
+        sel = { start: delStart, end: delStart, direction: "none" };
+      }
       applyLocalMutations(mutations, sel); return;
     }
     if (it === "deleteWordBackward") {

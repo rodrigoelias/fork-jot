@@ -2017,7 +2017,7 @@
     panel = document.createElement("div");
     panel.id = "confluencePanel";
     panel.className = "confluence-panel hidden";
-    panel.style.cssText = "padding:6px 12px;border-bottom:1px solid var(--border-color,#444);font-size:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--bg-elevated,rgba(255,255,255,0.03));";
+    panel.style.cssText = "padding:6px 12px;border-bottom:1px solid var(--line,#2a2a2a);font-size:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--panel,#121212);";
     const editorPane = refs.editorTextarea.closest(".editor-pane");
     if (editorPane) {
       editorPane.insertBefore(panel, editorPane.firstChild);
@@ -2040,19 +2040,21 @@
     const status = confluence.lastPushStatus === "pushing"
       ? " · publishing..."
       : confluence.lastPushStatus === "conflict"
-        ? " · <span style=\"color:#c33;\">conflict</span>"
+        ? " · <span style=\"color:var(--danger,#c33);\">conflict</span>"
         : confluence.lastPushStatus === "error"
-          ? " · <span style=\"color:#c33;\">error</span>"
+          ? " · <span style=\"color:var(--danger,#c33);\">error</span>"
           : "";
+    const publishDisabled = confluence.lastPushStatus === "pushing";
     const ownerControls = isOwner
       ? `
-        <button type="button" id="confluencePublishBtn" ${confluence.lastPushStatus === "pushing" ? "disabled" : ""} style="padding:4px 10px;">Publish to Confluence</button>
-        <button type="button" id="confluenceRefreshBtn" style="padding:4px 10px;">Refresh</button>
-        <button type="button" id="confluenceAgentBtn" style="padding:4px 10px;">Agent access...</button>
+        <jot-button variant="primary" size="sm" id="confluencePublishBtn"${publishDisabled ? ' style="opacity:0.5;pointer-events:none;"' : ""}>Publish to Confluence</jot-button>
+        <jot-button variant="ghost" size="sm" id="confluenceRefreshBtn">Refresh</jot-button>
+        <jot-button variant="ghost" size="sm" id="confluenceAgentBtn">Agent access...</jot-button>
       `
       : "";
     panel.innerHTML = `
-      <span><strong>Confluence</strong> · page ${escapeHtml(confluence.pageId)} · v${escapeHtml(String(confluence.lastKnownPublishedVersion))}${escapeHtml(draftSuffix)} · ${escapeHtml(lastPushed)}${dirty}${status}</span>
+      <span><strong>Confluence</strong> · page ${escapeHtml(confluence.pageId)} · v${escapeHtml(String(confluence.lastKnownPublishedVersion))}${escapeHtml(draftSuffix)} · ${escapeHtml(lastPushed)} · comments stay in jot${dirty}${status}</span>
+      ${isOwner ? "" : '<span style="opacity:0.7;font-style:italic;">read-only — owner publishes/refreshes</span>'}
       <span style="flex:1"></span>
       ${ownerControls}
     `;
