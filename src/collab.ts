@@ -55,6 +55,7 @@ export type ConfluenceBindingPublic = {
   agentEditsAllowed: boolean;
   agentCommentsAllowed: boolean;
   hasUnpushedEdits: boolean;
+  hideMarkers: boolean;
 };
 
 export type ServerHelloMessage = {

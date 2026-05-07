@@ -96,6 +96,7 @@ type ConfluenceBinding = {
   lastPushError: string | null;
   agentEditsAllowed: boolean;
   agentCommentsAllowed: boolean;
+  hideMarkers: boolean;
   history: ConfluenceHistoryEntry[];
 };
 
@@ -1398,6 +1399,7 @@ app.post("/api/notes/confluence/import", requireOwnerApi, async (req, res) => {
       lastPushError: null,
       agentEditsAllowed: false,
       agentCommentsAllowed: false,
+      hideMarkers: true,
       history: [
         {
           at: timestamp,
@@ -1480,6 +1482,18 @@ app.patch("/api/notes/:id/confluence", requireOwnerApi, (req, res) => {
       appendConfluenceHistory(note, {
         by: describeAuthIdentity(req),
         action: "set-agent-comments-allowed",
+        details: { value: next },
+      });
+      changed = true;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "hideMarkers")) {
+    const next = Boolean(body.hideMarkers);
+    if (next !== note.confluence.hideMarkers) {
+      note.confluence.hideMarkers = next;
+      appendConfluenceHistory(note, {
+        by: describeAuthIdentity(req),
+        action: "set-hide-markers",
         details: { value: next },
       });
       changed = true;
@@ -2248,6 +2262,7 @@ function normalizeConfluenceBinding(input: ConfluenceBinding): ConfluenceBinding
     lastPushError: input.lastPushError ?? null,
     agentEditsAllowed: Boolean(input.agentEditsAllowed),
     agentCommentsAllowed: Boolean(input.agentCommentsAllowed),
+    hideMarkers: input.hideMarkers !== false,
     history: Array.isArray(input.history) ? truncateHistoryPreservingHead(input.history) : [],
   };
 }
@@ -2371,6 +2386,7 @@ function publicConfluenceBinding(note: NoteRecord): ConfluenceBindingPublic | un
     agentEditsAllowed: c.agentEditsAllowed,
     agentCommentsAllowed: c.agentCommentsAllowed,
     hasUnpushedEdits: hasUnpushedEdits(note),
+    hideMarkers: c.hideMarkers,
   };
 }
 

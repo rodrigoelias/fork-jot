@@ -408,6 +408,97 @@ export function visibleLengthBefore(markerKeys, idList, fullIndex) {
   return visible;
 }
 
+// Build the marker-stripped projection of an IdList + text pair.
+//
+// Returns {
+//   visibleText: string,
+//   visibleToFull: number[],   // visibleToFull[k] = annotated idx of k-th visible char
+//                              // length is visibleText.length + 1; last entry = annotated.length
+//                              // (so a cursor at end-of-visible maps to end-of-annotated)
+//   fullToVisible: number[],   // fullToVisible[i] = visible offset just before annotated idx i
+//                              // length is annotated.length + 1 (to support cursor-at-end)
+// }
+//
+// When markerKeys is empty (or undefined), returns identity maps so non-Confluence
+// notes pay zero translation cost beyond a single O(N) walk.
+export function visibleProjection(idList, text, markerKeys) {
+  const annotatedLength = idList.length;
+  const isIdentity = !markerKeys || markerKeys.size === 0;
+
+  if (isIdentity) {
+    const visibleToFull = new Array(annotatedLength + 1);
+    const fullToVisible = new Array(annotatedLength + 1);
+    for (let i = 0; i <= annotatedLength; i++) {
+      visibleToFull[i] = i;
+      fullToVisible[i] = i;
+    }
+    return { visibleText: text, visibleToFull, fullToVisible };
+  }
+
+  const visibleChars = [];
+  const visibleToFull = [];
+  const fullToVisible = new Array(annotatedLength + 1);
+  let visIdx = 0;
+  // Walk entries directly to keep this O(N). idList.entries is the SimpleIdList
+  // backing array (with isDeleted entries interleaved); skip deleted entries to
+  // align with annotated indices.
+  let i = 0;
+  const entries = idList.entries;
+  if (Array.isArray(entries)) {
+    for (const entry of entries) {
+      if (entry.isDeleted) continue;
+      fullToVisible[i] = visIdx;
+      const key = `${entry.id.bunchId}:${entry.id.counter}`;
+      if (!markerKeys.has(key)) {
+        visibleChars.push(text[i]);
+        visibleToFull.push(i);
+        visIdx++;
+      }
+      i++;
+    }
+  } else {
+    // Fallback: walk by .at() (O(N²) but correct).
+    for (; i < annotatedLength; i++) {
+      fullToVisible[i] = visIdx;
+      const id = idList.at(i);
+      const key = `${id.bunchId}:${id.counter}`;
+      if (!markerKeys.has(key)) {
+        visibleChars.push(text[i]);
+        visibleToFull.push(i);
+        visIdx++;
+      }
+    }
+  }
+  fullToVisible[annotatedLength] = visIdx;
+  visibleToFull.push(annotatedLength);
+
+  return {
+    visibleText: visibleChars.join(""),
+    visibleToFull,
+    fullToVisible,
+  };
+}
+
+// Translate annotated offset → visible offset.
+export function annotatedToVisible(maps, fullIndex) {
+  const i = Math.max(0, Math.min(fullIndex, maps.fullToVisible.length - 1));
+  return maps.fullToVisible[i];
+}
+
+// Translate visible offset → annotated offset.
+// bias="right" returns the annotated index of the visible char at visIndex
+// (or end-of-annotated if visIndex === visibleLength). bias="left" snaps a
+// visible-end-of-selection to "just after the previous visible char."
+export function visibleToAnnotated(maps, visIndex, bias = "right") {
+  const len = maps.visibleToFull.length - 1; // last entry is end-sentinel
+  const v = Math.max(0, Math.min(visIndex, len));
+  if (bias === "left") {
+    if (v === 0) return maps.visibleToFull[0] ?? 0;
+    return maps.visibleToFull[v - 1] + 1;
+  }
+  return maps.visibleToFull[v];
+}
+
 export function selectionFromIds(selection, idList) {
   try {
     if (selection.type === "cursor") {

@@ -7,6 +7,9 @@ import {
   isInsertInsideMarker,
   selectionFromIds,
   selectionToIds,
+  visibleProjection,
+  annotatedToVisible,
+  visibleToAnnotated,
 } from "./collab-shared.js";
 
 const PRESENCE_THROTTLE_MS = 80;
@@ -134,6 +137,24 @@ export function createCollabEditor(textarea, opts) {
   let pendingMutations = [];
   let markerKeys = new Set();
   let confluenceMeta = null;
+  let projection = null; // { visibleText, visibleToFull, fullToVisible }
+
+  function ensureProjection() {
+    if (!projection) {
+      const keys = isHidingMarkers() ? markerKeys : new Set();
+      projection = visibleProjection(currentState.idList, currentState.text, keys);
+    }
+    return projection;
+  }
+
+  function invalidateProjection() {
+    projection = null;
+  }
+
+  function isHidingMarkers() {
+    // Hide only when the binding asks for it. Default true.
+    return Boolean(confluenceMeta && confluenceMeta.hideMarkers !== false && markerKeys.size > 0);
+  }
 
   // Remote presence
   const remoteCursors = new Map(); // clientId -> { name, color, selection, lastUpdate }
@@ -182,14 +203,30 @@ export function createCollabEditor(textarea, opts) {
   // ---- Rendering ----
 
   function render(sel) {
-    const s = clampSel(currentState.text, sel || {
-      start: textarea.selectionStart, end: textarea.selectionEnd, direction: textarea.selectionDirection || "none",
-    });
+    const proj = ensureProjection();
+    const annotatedText = currentState.text;
+    const visibleText = proj.visibleText;
+
+    // Translate the incoming sel (annotated indices) to visible for setSelectionRange.
+    // If sel is null, read the textarea's current selection (which is in visible space)
+    // and pass through.
+    let visStart, visEnd, dir;
+    if (sel) {
+      const clamped = clampSel(annotatedText, sel);
+      visStart = annotatedToVisible(proj, clamped.start);
+      visEnd = annotatedToVisible(proj, clamped.end);
+      dir = clamped.direction;
+    } else {
+      visStart = Math.max(0, Math.min(textarea.selectionStart, visibleText.length));
+      visEnd = Math.max(0, Math.min(textarea.selectionEnd, visibleText.length));
+      dir = textarea.selectionDirection || "none";
+    }
+
     programmatic = true;
-    textarea.value = currentState.text;
-    textarea.setSelectionRange(s.start, s.end, s.direction);
+    textarea.value = visibleText;
+    textarea.setSelectionRange(visStart, visEnd, dir);
     queueMicrotask(() => { programmatic = false; });
-    onTextChange?.(currentState.text);
+    onTextChange?.(visibleText); // preview consumers see the visible projection
     renderRemoteCursors();
   }
 
@@ -203,9 +240,10 @@ export function createCollabEditor(textarea, opts) {
       if (Date.now() - info.lastUpdate > PRESENCE_STALE_MS) { remoteCursors.delete(cid); continue; }
       try {
         const sel = selectionFromIds(info.selection, currentState.idList);
-        const idx = sel.start;
-        indices.push(idx);
-        cursorData.push({ idx, name: info.name, color: info.color });
+        const proj = ensureProjection();
+        const visIdx = annotatedToVisible(proj, sel.start);
+        indices.push(visIdx);
+        cursorData.push({ idx: visIdx, name: info.name, color: info.color });
       } catch {}
     }
 
@@ -245,8 +283,13 @@ export function createCollabEditor(textarea, opts) {
 
   function sendPresence() {
     if (!initialized || !connected || !clientId || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const proj = ensureProjection();
+    const visSs = textarea.selectionStart;
+    const visSe = textarea.selectionEnd;
+    const annSs = visibleToAnnotated(proj, visSs, "right");
+    const annSe = visibleToAnnotated(proj, visSe, "left");
     const sel = selectionToIds(
-      currentState.idList, textarea.selectionStart, textarea.selectionEnd,
+      currentState.idList, annSs, annSe,
       textarea.selectionDirection || "none",
     );
     const key = JSON.stringify(sel);
@@ -277,6 +320,7 @@ export function createCollabEditor(textarea, opts) {
       currentState = applyClientMutation(currentState, m);
       pendingMutations.push(m);
     }
+    invalidateProjection();
     render(sel);
     if (ws && ws.readyState === WebSocket.OPEN && clientId) {
       ws.send(JSON.stringify({ type: "mutation", clientId, mutations }));
@@ -287,15 +331,20 @@ export function createCollabEditor(textarea, opts) {
   // ---- Server messages ----
 
   function receiveHello(msg) {
-    const selIds = initialized
-      ? selectionToIds(currentState.idList, textarea.selectionStart, textarea.selectionEnd, textarea.selectionDirection || "none")
-      : null;
+    let selIds = null;
+    if (initialized) {
+      const proj = ensureProjection();
+      const annSs = visibleToAnnotated(proj, textarea.selectionStart, "right");
+      const annSe = visibleToAnnotated(proj, textarea.selectionEnd, "left");
+      selIds = selectionToIds(currentState.idList, annSs, annSe, textarea.selectionDirection || "none");
+    }
 
     if (msg.clientId) clientId = msg.clientId;
     serverState = { text: msg.markdown || "", idList: SimpleIdList.load(msg.idListState || []) };
     currentState = replayPending(serverState, pendingMutations);
     markerKeys = buildMarkerKeySet(msg.markerCharKeys);
     confluenceMeta = msg.confluence || null;
+    invalidateProjection();
     initialized = true;
     setConnected(true);
     reconnectDelay = RECONNECT_BASE_MS;
@@ -304,7 +353,7 @@ export function createCollabEditor(textarea, opts) {
       noteId: msg.noteId,
       title: msg.title,
       shareId: msg.shareId,
-      markdown: currentState.text,
+      markdown: ensureProjection().visibleText,
       confluence: confluenceMeta,
       markerCharKeys: msg.markerCharKeys || [],
     });
@@ -317,13 +366,17 @@ export function createCollabEditor(textarea, opts) {
 
   function receiveMutation(msg) {
     if (!initialized) return;
-    const selIds = selectionToIds(currentState.idList, textarea.selectionStart, textarea.selectionEnd, textarea.selectionDirection || "none");
+    const projBefore = ensureProjection();
+    const annSs = visibleToAnnotated(projBefore, textarea.selectionStart, "right");
+    const annSe = visibleToAnnotated(projBefore, textarea.selectionEnd, "left");
+    const selIds = selectionToIds(currentState.idList, annSs, annSe, textarea.selectionDirection || "none");
     serverState = { text: msg.markdown || "", idList: applyIdListUpdates(serverState.idList, msg.idListUpdates || []) };
     if (msg.senderId === clientId) {
       const idx = pendingMutations.findIndex((m) => m.clientCounter === msg.senderCounter);
       if (idx !== -1) pendingMutations = pendingMutations.slice(idx + 1);
     }
     currentState = replayPending(serverState, pendingMutations);
+    invalidateProjection();
     render(selectionFromIds(selIds, currentState.idList));
     throttledPresence();
   }
@@ -345,9 +398,13 @@ export function createCollabEditor(textarea, opts) {
     if (event.isComposing || event.inputType.includes("Composition")) return;
 
     const it = event.inputType;
-    const ss = textarea.selectionStart;
-    const se = textarea.selectionEnd;
-    const hasSel = ss !== se;
+    const proj = ensureProjection();
+    const visSs = textarea.selectionStart;
+    const visSe = textarea.selectionEnd;
+    // Translate to annotated for mutation construction.
+    const ss = visibleToAnnotated(proj, visSs, "right");
+    const se = visibleToAnnotated(proj, visSe, "left");
+    const hasSel = visSs !== visSe;
 
     // Marker guard: refuse inserts strictly inside `<!-- @path:... -->` runs,
     // and refuse deletes that would split a marker run. Mirrors the server
@@ -403,20 +460,24 @@ export function createCollabEditor(textarea, opts) {
     }
     if (it === "deleteContentBackward") {
       event.preventDefault();
-      if (!hasSel && ss > 0) {
-        let delStart = ss - 1;
+      if (!hasSel && visSs > 0) {
+        // Compute the deletion range in annotated space: from the annotated
+        // index of the previous visible char up to the current annotated cursor.
+        let delStart = visibleToAnnotated(proj, visSs - 1, "right");
         let delEnd = ss;
         if (markerKeys.size > 0) {
           // If the char being deleted is in a marker run, extend backwards to
           // the start of the run.
-          const idAtDel = currentState.idList.at(delStart);
-          const keyAtDel = `${idAtDel.bunchId}:${idAtDel.counter}`;
-          if (markerKeys.has(keyAtDel)) {
-            while (delStart > 0) {
-              const prevId = currentState.idList.at(delStart - 1);
-              const prevKey = `${prevId.bunchId}:${prevId.counter}`;
-              if (!markerKeys.has(prevKey)) break;
-              delStart--;
+          if (delStart < currentState.idList.length) {
+            const idAtDel = currentState.idList.at(delStart);
+            const keyAtDel = `${idAtDel.bunchId}:${idAtDel.counter}`;
+            if (markerKeys.has(keyAtDel)) {
+              while (delStart > 0) {
+                const prevId = currentState.idList.at(delStart - 1);
+                const prevKey = `${prevId.bunchId}:${prevId.counter}`;
+                if (!markerKeys.has(prevKey)) break;
+                delStart--;
+              }
             }
           }
         }
@@ -427,18 +488,21 @@ export function createCollabEditor(textarea, opts) {
     }
     if (it === "deleteContentForward") {
       event.preventDefault();
-      if (!hasSel && ss < currentState.text.length) {
+      if (!hasSel && visSe < proj.visibleText.length) {
+        // Delete from annotated cursor up to the annotated index just after the next visible char.
         let delStart = ss;
-        let delEnd = ss + 1;
+        let delEnd = visibleToAnnotated(proj, visSe + 1, "left");
         if (markerKeys.size > 0) {
-          const idAtDel = currentState.idList.at(delStart);
-          const keyAtDel = `${idAtDel.bunchId}:${idAtDel.counter}`;
-          if (markerKeys.has(keyAtDel)) {
-            while (delEnd < currentState.idList.length) {
-              const nextId = currentState.idList.at(delEnd);
-              const nextKey = `${nextId.bunchId}:${nextId.counter}`;
-              if (!markerKeys.has(nextKey)) break;
-              delEnd++;
+          if (delStart < currentState.idList.length) {
+            const idAtDel = currentState.idList.at(delStart);
+            const keyAtDel = `${idAtDel.bunchId}:${idAtDel.counter}`;
+            if (markerKeys.has(keyAtDel)) {
+              while (delEnd < currentState.idList.length) {
+                const nextId = currentState.idList.at(delEnd);
+                const nextKey = `${nextId.bunchId}:${nextId.counter}`;
+                if (!markerKeys.has(nextKey)) break;
+                delEnd++;
+              }
             }
           }
         }
@@ -449,17 +513,32 @@ export function createCollabEditor(textarea, opts) {
     }
     if (it === "deleteWordBackward") {
       event.preventDefault();
-      if (!hasSel && ss > 0) { const s = wordBackward(currentState.text, ss); pushDel(s, ss); sel = { start: s, end: s, direction: "none" }; }
+      if (!hasSel && visSs > 0) {
+        const visStart = wordBackward(proj.visibleText, visSs);
+        const annStart = visibleToAnnotated(proj, visStart, "right");
+        pushDel(annStart, ss);
+        sel = { start: annStart, end: annStart, direction: "none" };
+      }
       applyLocalMutations(mutations, sel); return;
     }
     if (it === "deleteWordForward") {
       event.preventDefault();
-      if (!hasSel && ss < currentState.text.length) { const e = wordForward(currentState.text, ss); pushDel(ss, e); sel = { start: ss, end: ss, direction: "none" }; }
+      if (!hasSel && visSe < proj.visibleText.length) {
+        const visEnd = wordForward(proj.visibleText, visSe);
+        const annEnd = visibleToAnnotated(proj, visEnd, "left");
+        pushDel(ss, annEnd);
+        sel = { start: ss, end: ss, direction: "none" };
+      }
       applyLocalMutations(mutations, sel); return;
     }
     if (it === "deleteSoftLineBackward" || it === "deleteHardLineBackward") {
       event.preventDefault();
-      if (!hasSel && ss > 0) { const s = lineBackward(currentState.text, ss); pushDel(s, ss); sel = { start: s, end: s, direction: "none" }; }
+      if (!hasSel && visSs > 0) {
+        const visStart = lineBackward(proj.visibleText, visSs);
+        const annStart = visibleToAnnotated(proj, visStart, "right");
+        pushDel(annStart, ss);
+        sel = { start: annStart, end: annStart, direction: "none" };
+      }
       applyLocalMutations(mutations, sel); return;
     }
   }
@@ -470,22 +549,34 @@ export function createCollabEditor(textarea, opts) {
   }
 
   function applyDiffFallback(nextText) {
-    if (!initialized || nextText === currentState.text) return;
-    const prev = currentState.text;
+    if (!initialized) return;
+    const proj = ensureProjection();
+    if (nextText === proj.visibleText) return;
+    const prev = proj.visibleText;
     let prefix = 0;
     while (prefix < prev.length && prefix < nextText.length && prev[prefix] === nextText[prefix]) prefix++;
     let ps = prev.length, ns = nextText.length;
     while (ps > prefix && ns > prefix && prev[ps - 1] === nextText[ns - 1]) { ps--; ns--; }
 
+    // prefix, ps are visible offsets. Translate to annotated for the mutations.
+    const annPrefix = visibleToAnnotated(proj, prefix, "right");
+    const annPs = visibleToAnnotated(proj, ps, "left");
+
     const mutations = [];
     let ws2 = { text: currentState.text, idList: currentState.idList.clone() };
-    const dm = buildDeleteMutation(ws2, prefix, ps, nextClientCounter);
+    const dm = buildDeleteMutation(ws2, annPrefix, annPs, nextClientCounter);
     if (dm) { nextClientCounter++; mutations.push(dm); ws2 = applyClientMutation(ws2, dm); }
     const ins = nextText.slice(prefix, ns);
-    if (ins) { const im = buildInsertMutation(ws2, prefix, ins, nextClientCounter, newId); if (im) { nextClientCounter++; mutations.push(im); } }
-    if (!mutations.length) { render({ start: prefix, end: prefix, direction: "none" }); return; }
-    const cursor = prefix + ins.length;
-    applyLocalMutations(mutations, { start: cursor, end: cursor, direction: "none" });
+    if (ins) { const im = buildInsertMutation(ws2, annPrefix, ins, nextClientCounter, newId); if (im) { nextClientCounter++; mutations.push(im); } }
+    if (!mutations.length) {
+      const visCursor = prefix;
+      const annCursor = visibleToAnnotated(proj, visCursor, "right");
+      render({ start: annCursor, end: annCursor, direction: "none" });
+      return;
+    }
+    const visCursor = prefix + ins.length;
+    const annCursor = visibleToAnnotated(proj, visCursor, "right");
+    applyLocalMutations(mutations, { start: annCursor, end: annCursor, direction: "none" });
   }
 
   // ---- WebSocket ----
@@ -505,10 +596,14 @@ export function createCollabEditor(textarea, opts) {
       else if (msg.type === "threads-updated") onThreadsUpdated?.();
       else if (msg.type === "marker-ids") {
         markerKeys = buildMarkerKeySet(msg.markerCharKeys);
+        invalidateProjection();
         opts.onMarkerIdsChanged?.(msg.markerCharKeys || []);
+        if (initialized) render(null);
       } else if (msg.type === "confluence-meta") {
         confluenceMeta = msg.confluence || confluenceMeta;
+        invalidateProjection();
         opts.onConfluenceMeta?.(msg.confluence);
+        if (initialized) render(null);
       } else if (msg.type === "confluence-push") {
         opts.onConfluencePush?.(msg);
       } else if (msg.type === "confluence-refresh") {
@@ -529,7 +624,10 @@ export function createCollabEditor(textarea, opts) {
 
   textarea.addEventListener("beforeinput", handleBeforeInput);
   textarea.addEventListener("input", handleInput);
-  textarea.addEventListener("compositionend", () => { if (textarea.value !== currentState.text) applyDiffFallback(textarea.value); });
+  textarea.addEventListener("compositionend", () => {
+    const proj = ensureProjection();
+    if (textarea.value !== proj.visibleText) applyDiffFallback(textarea.value);
+  });
   document.addEventListener("selectionchange", () => { if (document.activeElement === textarea) throttledPresence(); });
   textarea.addEventListener("focus", throttledPresence);
   textarea.addEventListener("blur", throttledPresence);
