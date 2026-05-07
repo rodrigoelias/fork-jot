@@ -332,6 +332,82 @@ export function selectionToIds(idList, start, end, direction = "forward") {
   };
 }
 
+// Confluence marker helpers. For Confluence-bound notes the buffer carries
+// `<!-- @path:... -->` markers. The server tells us which ElementIds are
+// inside a marker run via hello.markerCharKeys / marker-ids messages. These
+// helpers let the editor (and any future visible-projection layer) detect
+// inside-marker positions and translate full-buffer offsets into a marker-
+// stripped projection.
+
+export function buildMarkerKeySet(markerCharKeys) {
+  const set = new Set();
+  if (Array.isArray(markerCharKeys)) {
+    for (const key of markerCharKeys) {
+      if (typeof key === "string") set.add(key);
+    }
+  }
+  return set;
+}
+
+function elementKeyAtIndex(idList, index) {
+  if (index < 0 || index >= idList.length) return null;
+  const id = idList.at(index);
+  return id ? `${id.bunchId}:${id.counter}` : null;
+}
+
+// True when an insert at `insertIndex` (full-buffer offset, equal to the
+// number of chars to the left of the insertion point) would land strictly
+// inside a marker run — i.e. both the char immediately before AND the char
+// immediately after the insertion point belong to the same marker run.
+// Boundary inserts (just before "<!--" or just after "-->") are allowed.
+export function isInsertInsideMarker(markerKeys, idList, insertIndex) {
+  if (!markerKeys || markerKeys.size === 0) return false;
+  const beforeKey = insertIndex > 0 ? elementKeyAtIndex(idList, insertIndex - 1) : null;
+  if (!beforeKey || !markerKeys.has(beforeKey)) return false;
+  const afterKey = insertIndex < idList.length ? elementKeyAtIndex(idList, insertIndex) : null;
+  if (!afterKey || !markerKeys.has(afterKey)) return false;
+  return true;
+}
+
+// True when the half-open delete range [start, end) would split a marker run
+// (overlap that is neither empty nor whole-run).
+export function isDeletePartialMarker(markerKeys, idList, startIndex, endIndex) {
+  if (!markerKeys || markerKeys.size === 0) return false;
+  if (endIndex <= startIndex) return false;
+  for (let i = startIndex; i < endIndex; i++) {
+    const key = elementKeyAtIndex(idList, i);
+    if (!key || !markerKeys.has(key)) continue;
+    let runStart = i;
+    while (runStart > 0) {
+      const prevKey = elementKeyAtIndex(idList, runStart - 1);
+      if (!prevKey || !markerKeys.has(prevKey)) break;
+      runStart--;
+    }
+    let runEnd = i;
+    while (runEnd + 1 < idList.length) {
+      const nextKey = elementKeyAtIndex(idList, runEnd + 1);
+      if (!nextKey || !markerKeys.has(nextKey)) break;
+      runEnd++;
+    }
+    if (runStart < startIndex || runEnd >= endIndex) return true;
+    i = runEnd;
+  }
+  return false;
+}
+
+// Visible-projection helpers (kept here so any future projected-render layer
+// can share them). Each helper walks the idList honoring deleted entries.
+export function visibleLengthBefore(markerKeys, idList, fullIndex) {
+  if (!markerKeys || markerKeys.size === 0) return Math.max(0, Math.min(fullIndex, idList.length));
+  const max = Math.min(fullIndex, idList.length);
+  let visible = 0;
+  for (let i = 0; i < max; i++) {
+    const key = elementKeyAtIndex(idList, i);
+    if (!key || !markerKeys.has(key)) visible++;
+  }
+  return visible;
+}
+
 export function selectionFromIds(selection, idList) {
   try {
     if (selection.type === "cursor") {

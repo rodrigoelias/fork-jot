@@ -43,6 +43,20 @@ export type IdListUpdate =
       endIndex: number;
     };
 
+export type ConfluenceBindingPublic = {
+  pageId: string;
+  baseUrl: string;
+  importedAt: string;
+  lastKnownPublishedVersion: number;
+  lastKnownDraftVersion: number | null;
+  lastPushedAt: string | null;
+  lastPushStatus: "idle" | "pushing" | "pushed" | "conflict" | "error";
+  lastPushError: string | null;
+  agentEditsAllowed: boolean;
+  agentCommentsAllowed: boolean;
+  hasUnpushedEdits: boolean;
+};
+
 export type ServerHelloMessage = {
   type: "hello";
   clientId?: string;
@@ -52,6 +66,39 @@ export type ServerHelloMessage = {
   markdown: string;
   idListState: SavedIdList;
   serverCounter: number;
+  confluence?: ConfluenceBindingPublic;
+  markerCharKeys?: string[];
+};
+
+export type ServerConfluencePushMessage = {
+  type: "confluence-push";
+  noteId: string;
+  pageId: string;
+  status: "pushing" | "pushed" | "conflict" | "error";
+  oldVersion?: number;
+  newVersion?: number;
+  appliedCount?: number;
+  lastPushedAt?: string;
+  errorKind?: "fetch-conflict" | "draft-conflict" | "config" | "crash";
+  errorMessage?: string;
+};
+
+export type ServerConfluenceRefreshMessage = {
+  type: "confluence-refresh";
+  noteId: string;
+  pageId: string;
+};
+
+export type ServerConfluenceMetaMessage = {
+  type: "confluence-meta";
+  noteId: string;
+  confluence: ConfluenceBindingPublic;
+};
+
+export type ServerMarkerUpdateMessage = {
+  type: "marker-ids";
+  noteId: string;
+  markerCharKeys: string[];
 };
 
 export type ServerMutationMessage = {
@@ -161,8 +208,144 @@ export class TrackedIdList {
   }
 }
 
-function charKey(id: ElementId) {
+export function charKey(id: ElementId) {
   return `${id.bunchId}:${id.counter}`;
+}
+
+// Scan the live buffer for `<!-- @path:...-->` regions and return the set of
+// charKeys that fall inside any marker (including the opening "<!-- @path:" and
+// the closing "-->"). Used by both the server-side mutation validator and the
+// client-side render layer.
+export function scanMarkerIds(state: CollabState): Set<string> {
+  const result = new Set<string>();
+  const ids: ElementId[] = [];
+  const text: string[] = [];
+  for (const id of state.idList.values()) {
+    const ch = state.chars.get(charKey(id));
+    if (ch !== undefined) {
+      ids.push(id);
+      text.push(ch);
+    }
+  }
+  const joined = text.join("");
+  const re = /<!--\s*@path:[^]*?-->/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(joined)) !== null) {
+    for (let i = match.index; i < match.index + match[0].length; i++) {
+      result.add(charKey(ids[i]));
+    }
+  }
+  return result;
+}
+
+export const MARKER_OPEN_LITERAL = "<!-- @path:";
+
+export type MarkerValidationResult =
+  | { ok: true }
+  | { ok: false; reason: "insert-inside-marker" | "delete-partial-overlap" | "insert-contains-marker"; markerCharKey?: string };
+
+// Validate a single mutation against the current marker set. Mutations that
+// would corrupt a `<!-- @path:... -->` region are rejected.
+//
+// Boundary semantics: for an insert, "before" is the id immediately to the
+// left of the insertion point. The insertion is allowed when "before" sits at
+// the LAST char of a marker (insert lands just after the closing "-->") or
+// when the FIRST char following the insertion point is the start of a marker
+// (insert lands just before "<!--"). Insertions whose `before` lies within a
+// marker run AND the next char also belongs to the same marker run are the
+// only "strictly inside" case — those are rejected.
+export function validateMutationAgainstMarkers(
+  state: CollabState,
+  mutation: ClientMutation,
+  markerIds: Set<string>,
+): MarkerValidationResult {
+  if (markerIds.size === 0) return { ok: true };
+
+  if (mutation.name === "insert") {
+    if (typeof mutation.args.content === "string" && mutation.args.content.includes(MARKER_OPEN_LITERAL)) {
+      return { ok: false, reason: "insert-contains-marker" };
+    }
+    const { before } = mutation.args;
+    if (before === null) return { ok: true };
+    if (!state.idList.isKnown(before) || !state.idList.has(before)) return { ok: true };
+    const beforeKey = charKey(before);
+    if (!markerIds.has(beforeKey)) return { ok: true };
+    // `before` is inside a marker run. Find the next live id and check if it
+    // also belongs to the same marker (i.e. we are strictly inside).
+    let beforeIndex: number;
+    try {
+      beforeIndex = state.idList.indexOf(before, "left");
+    } catch {
+      return { ok: true };
+    }
+    if (beforeIndex < 0) return { ok: true };
+    const total = visibleLength(state);
+    if (beforeIndex + 1 >= total) {
+      // Marker is at the very end of the document — boundary insert allowed.
+      return { ok: true };
+    }
+    const nextId = state.idList.at(beforeIndex + 1);
+    const nextKey = charKey(nextId);
+    if (!markerIds.has(nextKey)) {
+      // Next char is outside any marker → insert at run boundary, allow.
+      return { ok: true };
+    }
+    return { ok: false, reason: "insert-inside-marker", markerCharKey: beforeKey };
+  }
+
+  // Delete: a marker run must be deleted whole-or-not-at-all.
+  const { startId, endId } = mutation.args;
+  if (!state.idList.isKnown(startId)) return { ok: true };
+
+  let startIndex: number;
+  try {
+    startIndex = state.idList.indexOf(startId, "right");
+  } catch {
+    return { ok: true };
+  }
+  let endIndex: number;
+  if (endId === undefined) {
+    endIndex = startIndex;
+  } else if (state.idList.isKnown(endId)) {
+    try {
+      endIndex = state.idList.indexOf(endId, "left");
+    } catch {
+      endIndex = startIndex - 1;
+    }
+  } else {
+    endIndex = startIndex - 1;
+  }
+  if (endIndex < startIndex) return { ok: true };
+
+  const visibleTotal = visibleLength(state);
+  // Walk all chars in [startIndex, endIndex]. For each marker run that
+  // overlaps the range, ensure the entire run is contained in the range.
+  for (let i = startIndex; i <= endIndex && i < visibleTotal; i++) {
+    const key = charKey(state.idList.at(i));
+    if (!markerIds.has(key)) continue;
+    // Walk the marker run forward and backward from i; the entire run must
+    // lie within [startIndex, endIndex].
+    let runStart = i;
+    while (runStart > 0 && markerIds.has(charKey(state.idList.at(runStart - 1)))) {
+      runStart--;
+    }
+    let runEnd = i;
+    while (runEnd + 1 < visibleTotal && markerIds.has(charKey(state.idList.at(runEnd + 1)))) {
+      runEnd++;
+    }
+    if (runStart < startIndex || runEnd > endIndex) {
+      return { ok: false, reason: "delete-partial-overlap", markerCharKey: key };
+    }
+    // Skip ahead to the end of this run.
+    i = runEnd;
+  }
+  return { ok: true };
+}
+
+function visibleLength(state: CollabState): number {
+  let n = 0;
+  for (const _ of state.idList.values()) n++;
+  return n;
 }
 
 export function newCollabState(): CollabState {

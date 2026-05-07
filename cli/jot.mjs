@@ -51,7 +51,18 @@ async function request(instance, method, endpoint, body) {
   const payload = await response.json();
 
   if (!response.ok) {
-    console.error(`Error ${response.status}: ${payload.error || payload.errors?.join(", ") || "Request failed"}`);
+    const code = payload.error || payload.errors?.join(", ") || "Request failed";
+    let hint = "";
+    if (code === "agent-edits-disabled") {
+      hint = " (the owner has not enabled agent edits on this note; ask them to flip 'Allow agent edits' in the editor)";
+    } else if (code === "agent-comments-disabled") {
+      hint = " (the owner has not enabled agent comments on this note; ask them to flip 'Allow agent comments' in the editor)";
+    } else if (code === "marker-conflict") {
+      hint = " (the edit overlaps a Confluence ADF marker; pick a different oldText)";
+    } else if (code === "owner-only") {
+      hint = " (this action requires owner access; only the human owner can publish/refresh from the UI)";
+    }
+    console.error(`Error ${response.status}: ${code}${hint}`);
     process.exit(1);
   }
 
@@ -497,6 +508,28 @@ switch (subCommand) {
     break;
   }
 
+  case "status": {
+    const noteId = args[2];
+    if (!noteId) {
+      console.error("Usage: jot <instance> status <id>");
+      console.error("       (Confluence binding status for a Confluence-bound note)");
+      process.exit(1);
+    }
+    const payload = await request(instance, "GET", `/api/notes/${noteId}/confluence/status`);
+    const c = payload.confluence;
+    console.log(`pageId: ${c.pageId}`);
+    console.log(`baseUrl: ${c.baseUrl}`);
+    console.log(`publishedVersion: ${c.lastKnownPublishedVersion}`);
+    console.log(`draftVersion: ${c.lastKnownDraftVersion ?? "(none)"}`);
+    console.log(`lastPushedAt: ${c.lastPushedAt ?? "(never)"}`);
+    console.log(`lastPushStatus: ${c.lastPushStatus}`);
+    if (c.lastPushError) console.log(`lastPushError: ${c.lastPushError}`);
+    console.log(`hasUnpushedEdits: ${c.hasUnpushedEdits}`);
+    console.log(`agentEditsAllowed: ${c.agentEditsAllowed}`);
+    console.log(`agentCommentsAllowed: ${c.agentCommentsAllowed}`);
+    break;
+  }
+
   default:
     console.error(`Unknown command: ${subCommand}`);
     printUsage();
@@ -534,6 +567,7 @@ Owner commands:
   jot <instance> update <id> title <val>   Update note title
   jot <instance> update <id> markdown <v>  Replace full markdown
   jot <instance> delete <id>               Delete a note
+  jot <instance> status <id>               Confluence binding status (Confluence-bound notes)
 
 Shared note commands:
   jot <instance> read                     Read the shared note

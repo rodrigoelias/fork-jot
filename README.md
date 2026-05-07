@@ -140,6 +140,120 @@ Share endpoints (no auth, access controlled by `shareAccess`):
 | POST   | `/api/share/:sid/threads/:tid/replies` | Reply                          |
 | POST   | `/api/share/:sid/render`               | Render markdown to HTML        |
 
+## Confluence-backed notes
+
+A jot note can be **bound to a Confluence page**. The collab buffer holds
+annotated markdown produced by `confluence-adf render --no-compress`; ADF
+lives only at the boundary, fetched and pushed via the
+[`confluence-adf`](https://github.com/rodrigoelias/the-confluence-plugin)
+Python CLI.
+
+### Setup
+
+The deployment uses one Confluence service account for all bindings (single
+tenant in v1):
+
+```
+export CONFLUENCE_BASE_URL="https://yourcompany.atlassian.net/wiki"
+export CONFLUENCE_EMAIL="bot@yourcompany.com"
+export CONFLUENCE_API_TOKEN="..."
+# optional: explicit path to the CLI; otherwise PATH or .venv/bin
+export CONFLUENCE_ADF_BIN="/usr/local/bin/confluence-adf"
+```
+
+When `GET /api/confluence/config` reports `configured: true`, the list page
+shows an "Import from Confluence" button. Importing a page creates a note
+seeded from the rendered annotated markdown and stores a `confluence` binding
+on the note.
+
+### Lifecycle
+
+- **Import** (`POST /api/notes/confluence/import`, owner-only): spawns
+  `confluence-adf render <pageId> --no-compress`, builds the note, records
+  the binding (page id, last known versions, sha256 of imported markdown).
+- **Edit**: as usual, via WebSocket or `POST /api/notes/:id/edit`. Edits
+  land in the server-side jot copy. `<!-- @path:... -->` markers are
+  protected by a server-side validator that rejects inserts/deletes that
+  would split a marker run; clients are notified via the `marker-ids` WS
+  message.
+- **Publish** (`POST /api/notes/:id/confluence/push`, owner-only): sends the
+  current buffer to `confluence-adf apply`. There is **no auto-publish**,
+  debounced or otherwise — the owner clicks Publish.
+- **Refresh** (`POST /api/notes/:id/confluence/refresh`, owner-only):
+  re-runs render and replaces the server-side copy. Returns `409
+  local-edits-would-be-lost` unless `force=true` or the buffer is unchanged
+  since the last publish.
+
+Confluence error mapping mirrors the CLI exit codes:
+
+| CLI exit | jot status   | UI behavior              |
+| -------- | ------------ | ------------------------ |
+| 0        | `pushed`     | success                  |
+| 4        | `conflict`   | fetch conflict modal     |
+| 5        | `conflict`   | draft conflict modal     |
+| 3        | `error`      | config message           |
+| else     | `error`      | crash message            |
+
+### Comments
+
+`CommentThread`s remain local to jot in v1. Two-way sync to Confluence
+inline annotations is a v2 follow-up.
+
+## Agents on Confluence pages
+
+Agents (API-key callers and share-link guests) can use jot's existing
+programmatic surface to drive a Confluence-bound note. Reads are always
+allowed; edit and comment access are **owner-opt-in per note** and default
+off. **Publish and Refresh are owner-only and never delegated.**
+
+### Read-only (default)
+
+| Method | Endpoint                                   | Notes                                   |
+| ------ | ------------------------------------------ | --------------------------------------- |
+| GET    | `/api/notes/:id`                           | Visible projection (markers stripped)   |
+| GET    | `/api/notes/:id?annotated=1`               | Owner-session-cookie only               |
+| GET    | `/api/notes/:id/confluence/status`         | Cheap; safe to poll                     |
+| GET    | `/api/share/:sid/note`                     | Visible projection                      |
+
+### Owner-opt-in (per note)
+
+| Method | Endpoint                                | Gated by                  |
+| ------ | --------------------------------------- | ------------------------- |
+| POST   | `/api/notes/:id/edit`                   | `agentEditsAllowed`       |
+| POST   | `/api/share/:sid/edit`                  | `agentEditsAllowed`       |
+| POST   | `/api/notes/:id/threads` (and replies)  | `agentCommentsAllowed`    |
+| POST   | `/api/share/:sid/threads` (and replies) | `agentCommentsAllowed`    |
+
+When the gate is closed the endpoint returns `403 agent-edits-disabled` /
+`403 agent-comments-disabled`. Edits that would split a `<!-- @path: ... -->`
+marker return `409 marker-conflict` with the offending marker key echoed.
+
+### Owner-only (never delegated)
+
+| Method | Endpoint                                | Notes                             |
+| ------ | --------------------------------------- | --------------------------------- |
+| POST   | `/api/notes/confluence/import`          | Bind a new note                   |
+| POST   | `/api/notes/:id/confluence/push`        | **Publish** to Confluence         |
+| POST   | `/api/notes/:id/confluence/refresh`     | Pull from Confluence              |
+| PATCH  | `/api/notes/:id/confluence`             | Toggle agent gates (audit-logged) |
+
+These endpoints all require an owner **session cookie**; an owner API key is
+not sufficient. This is deliberate — destructive Confluence-side actions are
+human-in-the-loop only.
+
+### CLI helpers
+
+The bundled `jot` CLI gains a `status` subcommand:
+
+```
+jot <instance> status <id>     # confluence binding status
+```
+
+`jot edit` and `jot comment` already exist; on Confluence-bound notes they
+surface a clear error when the per-note flag is off. **`jot publish` and
+`jot refresh` are intentionally not provided** — the owner publishes from
+the UI deliberately.
+
 ## License
 
 MIT

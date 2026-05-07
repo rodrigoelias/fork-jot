@@ -162,6 +162,22 @@
       window.location.href = `/notes/${payload.note.id}`;
     });
 
+    // Inject Confluence-import button next to the new-note button when the
+    // deployment has Confluence credentials configured. Hidden otherwise so
+    // we don't dangle UI for a feature the operator hasn't enabled.
+    (async () => {
+      try {
+        const cfg = await api("/api/confluence/config");
+        if (!cfg.configured) return;
+        const button = document.createElement("jot-icon-button");
+        button.setAttribute("icon", "share");
+        button.setAttribute("label", "Import from Confluence");
+        button.setAttribute("id", "confluenceImportButton");
+        newNoteButton.parentElement.insertBefore(button, newNoteButton);
+        button.addEventListener("click", () => openConfluenceImportModal(listModalBackdrop));
+      } catch {}
+    })();
+
     logoutButton.addEventListener("click", logoutOwner);
     settingsButton.addEventListener("click", () => openSettingsModal());
 
@@ -421,11 +437,13 @@
               title: payload.title,
               shareId: payload.shareId,
               markdown: payload.markdown,
+              confluence: payload.confluence || (state.note && state.note.confluence) || null,
             };
             if (refs.titleInput && document.activeElement !== refs.titleInput) {
               refs.titleInput.value = payload.title;
             }
             if (refs.topbarTitle) refs.topbarTitle.textContent = payload.title || "untitled";
+            window.__confluenceHandleHello?.(refs, payload);
             scheduleRender(refs);
           },
           onTextChange: (text) => {
@@ -443,6 +461,14 @@
           },
           onThreadsUpdated: () => {
             reloadThreads(isPublic);
+          },
+          onConfluenceMeta: (msg) => { window.__confluenceHandleMeta?.(refs, msg); },
+          onConfluencePush: (msg) => { window.__confluenceHandlePush?.(refs, msg); },
+          onConfluenceRefresh: () => { /* fresh hello will follow */ },
+          onMarkerGuard: (info) => {
+            setSaveStatus(refs, info.kind === "insert"
+              ? "Edit blocked: inside a Confluence marker"
+              : "Edit blocked: would split a Confluence marker");
           },
         });
       });
@@ -734,6 +760,7 @@
       state.note = payload.note;
       state.viewer = payload.viewer;
       state.threads = payload.threads;
+      renderConfluencePanel(refsArg, payload.note?.confluence || null, payload.viewer?.isOwner);
 
       if (refsArg.topbarTitle) {
         refsArg.topbarTitle.textContent = payload.note.title || "untitled";
@@ -957,11 +984,24 @@
     const baseUrl = `${location.protocol}//${location.host}`;
     const currentNoteId = state.note?.id || "<note-id>";
     const isOwnerView = state.viewer?.isOwner;
+    const confluence = state.note?.confluence;
+    const editsAllowed = confluence ? confluence.agentEditsAllowed : true;
+    const commentsAllowed = confluence ? confluence.agentCommentsAllowed : true;
 
     const lines = [];
     if (isOwnerView) {
       lines.push(
         `# Your user wants you to interact with a jot note using the CLI below.`,
+      );
+      if (confluence) {
+        lines.push(
+          `# This note is bound to Confluence page ${confluence.pageId}.`,
+          `# Reads are always allowed.`,
+          `# Edits are ${editsAllowed ? "ENABLED" : "DISABLED"}; comments are ${commentsAllowed ? "ENABLED" : "DISABLED"}.`,
+          `# Publishing back to Confluence is owner-only and never automatic.`,
+        );
+      }
+      lines.push(
         `# Run the commands as needed to read, edit, and comment on the note.`,
         ``,
         `npm install -g @mariozechner/jot`,
@@ -974,27 +1014,44 @@
         ``,
         `# Read this note (includes thread/message IDs)`,
         `jot my-jot read ${currentNoteId}`,
+      );
+      if (confluence) {
+        lines.push(
+          ``,
+          `# Inspect Confluence binding (cheap; safe to poll)`,
+          `jot my-jot status ${currentNoteId}`,
+        );
+      }
+      if (editsAllowed) {
+        lines.push(
+          ``,
+          `# Edit this note`,
+          `jot my-jot edit ${currentNoteId} '[{"oldText":"...","newText":"..."}]'`,
+        );
+      }
+      if (commentsAllowed) {
+        lines.push(
+          ``,
+          `# Comment on text in this note`,
+          `jot my-jot comment ${currentNoteId} "quoted text" "comment body"`,
+          ``,
+          `# Reply to a specific message`,
+          `jot my-jot reply ${currentNoteId} <thread-id> <message-id> "reply"`,
+          ``,
+          `# Edit or delete a comment`,
+          `jot my-jot edit-comment ${currentNoteId} <message-id> "new body"`,
+          `jot my-jot delete-comment ${currentNoteId} <message-id>`,
+          ``,
+          `# Resolve, reopen, or delete a thread`,
+          `jot my-jot resolve ${currentNoteId} <thread-id>`,
+          `jot my-jot reopen ${currentNoteId} <thread-id>`,
+          `jot my-jot delete-thread ${currentNoteId} <thread-id>`,
+        );
+      }
+      lines.push(
         ``,
         `# Create a note`,
         `jot my-jot create "My note title"`,
-        ``,
-        `# Edit this note`,
-        `jot my-jot edit ${currentNoteId} '[{"oldText":"...","newText":"..."}]'`,
-        ``,
-        `# Comment on text in this note`,
-        `jot my-jot comment ${currentNoteId} "quoted text" "comment body"`,
-        ``,
-        `# Reply to a specific message`,
-        `jot my-jot reply ${currentNoteId} <thread-id> <message-id> "reply"`,
-        ``,
-        `# Edit or delete a comment`,
-        `jot my-jot edit-comment ${currentNoteId} <message-id> "new body"`,
-        `jot my-jot delete-comment ${currentNoteId} <message-id>`,
-        ``,
-        `# Resolve, reopen, or delete a thread`,
-        `jot my-jot resolve ${currentNoteId} <thread-id>`,
-        `jot my-jot reopen ${currentNoteId} <thread-id>`,
-        `jot my-jot delete-thread ${currentNoteId} <thread-id>`,
         ``,
         `# Full command reference`,
         `jot --help`,
@@ -1901,4 +1958,268 @@
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#39;");
   }
+
+  // ------------------- Confluence integration UI -------------------
+
+  function openConfluenceImportModal(backdrop) {
+    backdrop.classList.remove("hidden");
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true">
+        <div class="settings-header">
+          <h2 class="settings-title">Import from Confluence</h2>
+          <jot-icon-button icon="close" label="Close" id="confluenceImportClose"></jot-icon-button>
+        </div>
+        <p>Paste a Confluence page ID. The page will be imported as a jot note bound to that page; nothing is published back to Confluence until you click Publish.</p>
+        <input id="confluencePageIdInput" type="text" placeholder="page id" autocomplete="off" style="width:100%;padding:8px;margin:8px 0;" />
+        <p id="confluenceImportError" class="confluence-import-error" style="color:#c33;display:none;"></p>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <jot-button variant="ghost" size="sm" id="confluenceImportCancel">cancel</jot-button>
+          <jot-button variant="primary" size="sm" id="confluenceImportSubmit">import</jot-button>
+        </div>
+      </div>
+    `;
+    const close = () => { backdrop.classList.add("hidden"); backdrop.innerHTML = ""; };
+    backdrop.querySelector("#confluenceImportClose").addEventListener("click", close);
+    backdrop.querySelector("#confluenceImportCancel").addEventListener("click", close);
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });
+    const input = backdrop.querySelector("#confluencePageIdInput");
+    const errEl = backdrop.querySelector("#confluenceImportError");
+    const submit = backdrop.querySelector("#confluenceImportSubmit");
+    input.focus();
+    submit.addEventListener("click", async () => {
+      const pageId = input.value.trim();
+      if (!pageId) return;
+      submit.setAttribute("disabled", "true");
+      errEl.style.display = "none";
+      try {
+        const response = await fetch("/api/notes/confluence/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pageId }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.message || payload.error || `Import failed (${response.status}).`);
+        }
+        window.location.href = `/notes/${payload.noteId}`;
+      } catch (error) {
+        submit.removeAttribute("disabled");
+        errEl.textContent = error.message || "Import failed.";
+        errEl.style.display = "";
+      }
+    });
+  }
+
+  function ensureConfluencePanel(refs) {
+    if (!refs || !refs.editorTextarea) return null;
+    let panel = document.getElementById("confluencePanel");
+    if (panel) return panel;
+    panel = document.createElement("div");
+    panel.id = "confluencePanel";
+    panel.className = "confluence-panel hidden";
+    panel.style.cssText = "padding:6px 12px;border-bottom:1px solid var(--border-color,#444);font-size:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--bg-elevated,rgba(255,255,255,0.03));";
+    const editorPane = refs.editorTextarea.closest(".editor-pane");
+    if (editorPane) {
+      editorPane.insertBefore(panel, editorPane.firstChild);
+    }
+    return panel;
+  }
+
+  function renderConfluencePanel(refs, confluence, isOwner) {
+    const panel = ensureConfluencePanel(refs);
+    if (!panel) return;
+    if (!confluence) { panel.classList.add("hidden"); panel.innerHTML = ""; return; }
+    panel.classList.remove("hidden");
+    const draftSuffix = confluence.lastKnownDraftVersion
+      ? ` (draft v${confluence.lastKnownDraftVersion})`
+      : "";
+    const lastPushed = confluence.lastPushedAt
+      ? `last pushed ${formatRelativeTime(confluence.lastPushedAt)} ago`
+      : "never pushed";
+    const dirty = confluence.hasUnpushedEdits ? " · <strong>unpushed edits</strong>" : "";
+    const status = confluence.lastPushStatus === "pushing"
+      ? " · publishing..."
+      : confluence.lastPushStatus === "conflict"
+        ? " · <span style=\"color:#c33;\">conflict</span>"
+        : confluence.lastPushStatus === "error"
+          ? " · <span style=\"color:#c33;\">error</span>"
+          : "";
+    const ownerControls = isOwner
+      ? `
+        <button type="button" id="confluencePublishBtn" ${confluence.lastPushStatus === "pushing" ? "disabled" : ""} style="padding:4px 10px;">Publish to Confluence</button>
+        <button type="button" id="confluenceRefreshBtn" style="padding:4px 10px;">Refresh</button>
+        <button type="button" id="confluenceAgentBtn" style="padding:4px 10px;">Agent access...</button>
+      `
+      : "";
+    panel.innerHTML = `
+      <span><strong>Confluence</strong> · page ${escapeHtml(confluence.pageId)} · v${escapeHtml(String(confluence.lastKnownPublishedVersion))}${escapeHtml(draftSuffix)} · ${escapeHtml(lastPushed)}${dirty}${status}</span>
+      <span style="flex:1"></span>
+      ${ownerControls}
+    `;
+    if (isOwner) {
+      panel.querySelector("#confluencePublishBtn")?.addEventListener("click", () => publishConfluence(refs));
+      panel.querySelector("#confluenceRefreshBtn")?.addEventListener("click", () => refreshConfluence(refs, false));
+      panel.querySelector("#confluenceAgentBtn")?.addEventListener("click", () => openAgentAccessModal(refs));
+    }
+  }
+
+  async function publishConfluence(refs) {
+    const noteId = state.note?.id;
+    if (!noteId) return;
+    try {
+      const response = await fetch(`/api/notes/${noteId}/confluence/push`, { method: "POST", headers: { "Content-Type": "application/json" } });
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok && payload.ok) {
+        if (state.note) state.note.confluence = payload.confluence;
+        renderConfluencePanel(refs, payload.confluence, state.viewer?.isOwner);
+      } else {
+        const result = payload.result || {};
+        if (state.note) state.note.confluence = payload.confluence || state.note.confluence;
+        renderConfluencePanel(refs, payload.confluence, state.viewer?.isOwner);
+        if (result.errorKind === "fetch-conflict" || result.errorKind === "draft-conflict") {
+          openConfluenceConflictModal(refs, result);
+        } else {
+          alert(`Publish failed: ${result.errorMessage || payload.error || response.status}`);
+        }
+      }
+    } catch (error) {
+      alert(`Publish failed: ${error.message || error}`);
+    }
+  }
+
+  async function refreshConfluence(refs, force) {
+    const noteId = state.note?.id;
+    if (!noteId) return;
+    try {
+      const response = await fetch(`/api/notes/${noteId}/confluence/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: Boolean(force) }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok && payload.ok) {
+        if (state.note) state.note.confluence = payload.confluence;
+        renderConfluencePanel(refs, payload.confluence, state.viewer?.isOwner);
+      } else if (response.status === 409 && payload.error === "local-edits-would-be-lost") {
+        if (confirm("Discard server-side edits and reload from Confluence?")) {
+          await refreshConfluence(refs, true);
+        }
+      } else {
+        alert(`Refresh failed: ${payload.message || payload.error || response.status}`);
+      }
+    } catch (error) {
+      alert(`Refresh failed: ${error.message || error}`);
+    }
+  }
+
+  function openConfluenceConflictModal(refs, result) {
+    if (!refs.modalBackdrop) return;
+    state.modalOpen = true;
+    refs.modalBackdrop.classList.remove("hidden");
+    refs.modalBackdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true">
+        <div class="settings-header">
+          <h2 class="settings-title">Confluence conflict</h2>
+          <jot-icon-button icon="close" label="Close" id="confluenceConflictClose"></jot-icon-button>
+        </div>
+        <p>Confluence rejected the publish: <strong>${escapeHtml(result.errorKind || "unknown")}</strong></p>
+        <pre style="background:var(--bg-elevated,rgba(0,0,0,0.2));padding:8px;font-size:11px;white-space:pre-wrap;max-height:200px;overflow:auto;">${escapeHtml(result.errorMessage || "")}</pre>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <jot-button variant="ghost" size="sm" id="confluenceConflictDismiss">dismiss</jot-button>
+          <jot-button variant="primary" size="sm" id="confluenceConflictForce">refresh (forced)</jot-button>
+        </div>
+      </div>
+    `;
+    const close = () => { closeModal(refs); };
+    refs.modalBackdrop.querySelector("#confluenceConflictClose").addEventListener("click", close);
+    refs.modalBackdrop.querySelector("#confluenceConflictDismiss").addEventListener("click", close);
+    refs.modalBackdrop.querySelector("#confluenceConflictForce").addEventListener("click", async () => {
+      close();
+      await refreshConfluence(refs, true);
+    });
+    refs.modalBackdrop.addEventListener("click", (e) => { if (e.target === refs.modalBackdrop) close(); });
+  }
+
+  function openAgentAccessModal(refs) {
+    const confluence = state.note?.confluence;
+    if (!refs.modalBackdrop || !confluence) return;
+    state.modalOpen = true;
+    refs.modalBackdrop.classList.remove("hidden");
+    refs.modalBackdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true">
+        <div class="settings-header">
+          <h2 class="settings-title">Agent access</h2>
+          <jot-icon-button icon="close" label="Close" id="agentAccessClose"></jot-icon-button>
+        </div>
+        <p>Agents (API-key callers and share-link guests) can read this note by default. Toggle the gates below to let them edit or comment. Publishing to Confluence is always owner-only.</p>
+        <label style="display:flex;align-items:center;gap:8px;margin:8px 0;">
+          <input type="checkbox" id="agentEditsAllowed" ${confluence.agentEditsAllowed ? "checked" : ""} />
+          <span>Allow agent edits</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;margin:8px 0;">
+          <input type="checkbox" id="agentCommentsAllowed" ${confluence.agentCommentsAllowed ? "checked" : ""} />
+          <span>Allow agent comments</span>
+        </label>
+        <p class="agent-hint" style="font-size:11px;opacity:0.7;">Edits land in the server-side jot copy until you click Publish. Toggling a flag off revokes access for any previously distributed snippets.</p>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <jot-button variant="ghost" size="sm" id="agentAccessDone">done</jot-button>
+        </div>
+      </div>
+    `;
+    const close = () => { closeModal(refs); };
+    refs.modalBackdrop.querySelector("#agentAccessClose").addEventListener("click", close);
+    refs.modalBackdrop.querySelector("#agentAccessDone").addEventListener("click", close);
+    refs.modalBackdrop.addEventListener("click", (e) => { if (e.target === refs.modalBackdrop) close(); });
+    const editsBox = refs.modalBackdrop.querySelector("#agentEditsAllowed");
+    const commentsBox = refs.modalBackdrop.querySelector("#agentCommentsAllowed");
+    const persist = async () => {
+      const noteId = state.note?.id;
+      if (!noteId) return;
+      try {
+        const response = await fetch(`/api/notes/${noteId}/confluence`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            agentEditsAllowed: editsBox.checked,
+            agentCommentsAllowed: commentsBox.checked,
+          }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (response.ok && payload.ok && state.note) {
+          state.note.confluence = payload.confluence;
+          renderConfluencePanel(refs, payload.confluence, true);
+        }
+      } catch {}
+    };
+    editsBox.addEventListener("change", persist);
+    commentsBox.addEventListener("change", persist);
+  }
+
+  // Hooks invoked by initNotePage so the Confluence WS messages can reach the
+  // panel.
+  window.__confluenceHandleHello = function (refs, payload) {
+    if (state.note) state.note.confluence = payload.confluence || null;
+    renderConfluencePanel(refs, payload.confluence || null, state.viewer?.isOwner);
+  };
+  window.__confluenceHandleMeta = function (refs, msg) {
+    if (state.note) state.note.confluence = msg.confluence || null;
+    renderConfluencePanel(refs, msg.confluence || null, state.viewer?.isOwner);
+  };
+  window.__confluenceHandlePush = function (refs, msg) {
+    if (state.note?.confluence) {
+      state.note.confluence.lastPushStatus = msg.status;
+      if (msg.status === "pushed") {
+        state.note.confluence.lastPushedAt = msg.lastPushedAt || state.note.confluence.lastPushedAt;
+        state.note.confluence.lastKnownDraftVersion = msg.newVersion ?? state.note.confluence.lastKnownDraftVersion;
+        state.note.confluence.lastPushError = null;
+        state.note.confluence.hasUnpushedEdits = false;
+      } else if (msg.status === "conflict" || msg.status === "error") {
+        state.note.confluence.lastPushError = msg.errorMessage || null;
+      }
+      renderConfluencePanel(refs, state.note.confluence, state.viewer?.isOwner);
+    }
+    if ((msg.status === "conflict") && (msg.errorKind === "fetch-conflict" || msg.errorKind === "draft-conflict")) {
+      openConfluenceConflictModal(refs, msg);
+    }
+  };
 })();

@@ -2,6 +2,9 @@ import {
   SimpleIdList,
   applyClientMutation,
   applyIdListUpdates,
+  buildMarkerKeySet,
+  isDeletePartialMarker,
+  isInsertInsideMarker,
   selectionFromIds,
   selectionToIds,
 } from "./collab-shared.js";
@@ -129,6 +132,8 @@ export function createCollabEditor(textarea, opts) {
   let serverState = { text: "", idList: new SimpleIdList() };
   let currentState = { text: "", idList: new SimpleIdList() };
   let pendingMutations = [];
+  let markerKeys = new Set();
+  let confluenceMeta = null;
 
   // Remote presence
   const remoteCursors = new Map(); // clientId -> { name, color, selection, lastUpdate }
@@ -289,11 +294,20 @@ export function createCollabEditor(textarea, opts) {
     if (msg.clientId) clientId = msg.clientId;
     serverState = { text: msg.markdown || "", idList: SimpleIdList.load(msg.idListState || []) };
     currentState = replayPending(serverState, pendingMutations);
+    markerKeys = buildMarkerKeySet(msg.markerCharKeys);
+    confluenceMeta = msg.confluence || null;
     initialized = true;
     setConnected(true);
     reconnectDelay = RECONNECT_BASE_MS;
     render(selIds ? selectionFromIds(selIds, currentState.idList) : { start: 0, end: 0, direction: "none" });
-    onReady?.({ noteId: msg.noteId, title: msg.title, shareId: msg.shareId, markdown: currentState.text });
+    onReady?.({
+      noteId: msg.noteId,
+      title: msg.title,
+      shareId: msg.shareId,
+      markdown: currentState.text,
+      confluence: confluenceMeta,
+      markerCharKeys: msg.markerCharKeys || [],
+    });
 
     if (pendingMutations.length > 0 && ws && ws.readyState === WebSocket.OPEN && clientId) {
       ws.send(JSON.stringify({ type: "mutation", clientId, mutations: pendingMutations }));
@@ -334,6 +348,24 @@ export function createCollabEditor(textarea, opts) {
     const ss = textarea.selectionStart;
     const se = textarea.selectionEnd;
     const hasSel = ss !== se;
+
+    // Marker guard: refuse inserts strictly inside `<!-- @path:... -->` runs,
+    // and refuse deletes that would split a marker run. Mirrors the server
+    // validator so the user gets immediate feedback rather than a server
+    // bounce + hello reset.
+    if (markerKeys.size > 0) {
+      if (!hasSel && isInsertInsideMarker(markerKeys, currentState.idList, ss)) {
+        event.preventDefault();
+        opts.onMarkerGuard?.({ kind: "insert" });
+        return;
+      }
+      if (hasSel && isDeletePartialMarker(markerKeys, currentState.idList, ss, se)) {
+        event.preventDefault();
+        opts.onMarkerGuard?.({ kind: "delete" });
+        return;
+      }
+    }
+
     const mutations = [];
     let ws2 = { text: currentState.text, idList: currentState.idList.clone() };
 
@@ -431,6 +463,17 @@ export function createCollabEditor(textarea, opts) {
       else if (msg.type === "presence") receivePresence(msg);
       else if (msg.type === "presence-leave") receivePresenceLeave(msg);
       else if (msg.type === "threads-updated") onThreadsUpdated?.();
+      else if (msg.type === "marker-ids") {
+        markerKeys = buildMarkerKeySet(msg.markerCharKeys);
+        opts.onMarkerIdsChanged?.(msg.markerCharKeys || []);
+      } else if (msg.type === "confluence-meta") {
+        confluenceMeta = msg.confluence || confluenceMeta;
+        opts.onConfluenceMeta?.(msg.confluence);
+      } else if (msg.type === "confluence-push") {
+        opts.onConfluencePush?.(msg);
+      } else if (msg.type === "confluence-refresh") {
+        opts.onConfluenceRefresh?.(msg);
+      }
     });
     ws.addEventListener("close", () => {
       if (destroyed) return;

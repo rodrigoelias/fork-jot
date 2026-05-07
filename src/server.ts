@@ -11,8 +11,13 @@ import {
   type ClientMutation,
   type ClientMutationMessage,
   type ClientPresenceMessage,
+  type ConfluenceBindingPublic,
   type SavedCollabState,
+  type ServerConfluenceMetaMessage,
+  type ServerConfluencePushMessage,
+  type ServerConfluenceRefreshMessage,
   type ServerHelloMessage,
+  type ServerMarkerUpdateMessage,
   type ServerMutationMessage,
   type ServerPresenceMessage,
   type ServerPresenceLeaveMessage,
@@ -24,7 +29,17 @@ import {
   newCollabState,
   idBeforeIndex,
   idAtIndex,
+  scanMarkerIds,
+  validateMutationAgainstMarkers,
 } from "./collab.js";
+import {
+  applyAnnotated,
+  getConfluenceBaseUrl,
+  hasDraft,
+  isConfluenceConfigured,
+  renderAnnotated,
+  resolveConfluenceBin,
+} from "./confluence.js";
 import hljs from "highlight.js";
 import { marked, type Tokens } from "marked";
 import sanitizeHtml from "sanitize-html";
@@ -59,6 +74,28 @@ type CommentThread = {
 
 type ShareAccess = "none" | "view" | "comment" | "edit";
 
+type ConfluenceHistoryEntry = {
+  at: string;
+  by: string;
+  action: string;
+  details?: Record<string, string | number | boolean | null>;
+};
+
+type ConfluenceBinding = {
+  pageId: string;
+  baseUrl: string;
+  importedAt: string;
+  lastKnownPublishedVersion: number;
+  lastKnownDraftVersion: number | null;
+  lastPushedAt: string | null;
+  lastPushedMarkdownSha256: string | null;
+  lastPushStatus: "idle" | "pushing" | "pushed" | "conflict" | "error";
+  lastPushError: string | null;
+  agentEditsAllowed: boolean;
+  agentCommentsAllowed: boolean;
+  history: ConfluenceHistoryEntry[];
+};
+
 type NoteMetaFile = {
   id: string;
   title: string;
@@ -69,6 +106,7 @@ type NoteMetaFile = {
   threads: CommentThread[];
   collab?: SavedCollabState;
   collabState?: SavedCollabState;
+  confluence?: ConfluenceBinding;
 };
 
 type NoteRecord = {
@@ -82,6 +120,8 @@ type NoteRecord = {
   markdown: string;
   collab: CollabState;
   clientAcks: Map<string, number>;
+  confluence?: ConfluenceBinding;
+  markerIds: Set<string>;
 };
 
 type NoteSummary = {
@@ -303,20 +343,76 @@ app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
     return;
   }
 
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentEditsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-edits-disabled" });
+    return;
+  }
+
   const edits = req.body.edits;
   if (!Array.isArray(edits) || edits.length === 0) {
     res.status(400).json({ ok: false, error: "edits must be a non-empty array of {oldText, newText}." });
     return;
   }
 
+  const applyResult = applyHttpEdits(note, edits);
+  if (!applyResult.ok) {
+    res.status(applyResult.status).json(applyResult.body);
+    return;
+  }
+  const { workingCollab, markdown, senderCounter, idListUpdates } = applyResult;
+
+  note.collab = workingCollab;
+  note.markdown = markdown;
+  note.updatedAt = nowIso();
+  const markerChange = recomputeMarkerIds(note);
+  const titleChanged = Object.prototype.hasOwnProperty.call(req.body || {}, "title")
+    && normalizeTitle(String(req.body.title || note.title)) !== note.title;
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, "title")) {
+    note.title = normalizeTitle(String(req.body.title || note.title));
+  }
+  persistNote(note, false);
+
+  if (titleChanged) {
+    broadcastEditorHello(note);
+  } else if (idListUpdates.length > 0) {
+    broadcastEditorMutation(note, {
+      type: "mutation",
+      senderId: "__api__",
+      senderCounter,
+      serverCounter: note.collab.serverCounter,
+      markdown: note.markdown,
+      idListUpdates,
+    });
+  }
+  if (markerChange.changed) {
+    broadcastMarkerIds(note);
+  }
+  broadcastNoteUpdate(note);
+
+  res.json({ ok: true, savedAt: note.updatedAt });
+});
+
+type HttpEditsResult =
+  | {
+      ok: true;
+      workingCollab: CollabState;
+      markdown: string;
+      senderCounter: number;
+      idListUpdates: ServerMutationMessage["idListUpdates"];
+    }
+  | { ok: false; status: number; body: Record<string, unknown> };
+
+function applyHttpEdits(note: NoteRecord, edits: unknown[]): HttpEditsResult {
   let workingCollab = note.collab;
   let markdown = note.markdown;
   let senderCounter = 0;
   const errors: string[] = [];
   const idListUpdates: ServerMutationMessage["idListUpdates"] = [];
+  let workingMarkerIds = new Set(note.markerIds);
+  const isConfluenceBound = Boolean(note.confluence);
 
   for (let i = 0; i < edits.length; i++) {
-    const edit = edits[i];
+    const edit = edits[i] as { oldText?: unknown; newText?: unknown } | undefined;
     const oldText = String(edit?.oldText || "");
     const newText = String(edit?.newText || "");
 
@@ -365,49 +461,52 @@ app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
       });
     }
 
+    if (isConfluenceBound && workingMarkerIds.size > 0) {
+      for (const mutation of mutations) {
+        const verdict = validateMutationAgainstMarkers(workingCollab, mutation, workingMarkerIds);
+        if (!verdict.ok) {
+          return {
+            ok: false,
+            status: 409,
+            body: {
+              ok: false,
+              error: "marker-conflict",
+              reason: verdict.reason,
+              markerCharKey: verdict.markerCharKey || null,
+              editIndex: i,
+            },
+          };
+        }
+      }
+    }
+
     const result = applyClientMutations(workingCollab, mutations);
     workingCollab = result.state;
     markdown = result.markdown;
     idListUpdates.push(...result.idListUpdates);
     senderCounter = mutations.at(-1)?.clientCounter || senderCounter;
+
+    if (isConfluenceBound) {
+      workingMarkerIds = scanMarkerIds(workingCollab);
+    }
   }
 
   if (errors.length > 0) {
-    res.status(400).json({ ok: false, errors });
-    return;
+    return { ok: false, status: 400, body: { ok: false, errors } };
   }
 
-  note.collab = workingCollab;
-  note.markdown = markdown;
-  note.updatedAt = nowIso();
-  const titleChanged = Object.prototype.hasOwnProperty.call(req.body || {}, "title")
-    && normalizeTitle(String(req.body.title || note.title)) !== note.title;
-  if (Object.prototype.hasOwnProperty.call(req.body || {}, "title")) {
-    note.title = normalizeTitle(String(req.body.title || note.title));
-  }
-  persistNote(note, false);
-
-  if (titleChanged) {
-    broadcastEditorHello(note);
-  } else if (idListUpdates.length > 0) {
-    broadcastEditorMutation(note, {
-      type: "mutation",
-      senderId: "__api__",
-      senderCounter,
-      serverCounter: note.collab.serverCounter,
-      markdown: note.markdown,
-      idListUpdates,
-    });
-  }
-  broadcastNoteUpdate(note);
-
-  res.json({ ok: true, savedAt: note.updatedAt });
-});
+  return { ok: true, workingCollab, markdown, senderCounter, idListUpdates };
+}
 
 app.post("/api/notes/:id/threads", requireOwnerApi, (req, res) => {
   const note = notes.get(String(req.params.id));
   if (!note) {
     res.status(404).json({ ok: false, error: "Note not found." });
+    return;
+  }
+
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
     return;
   }
 
@@ -466,6 +565,11 @@ app.post("/api/notes/:id/threads/:threadId/replies", requireOwnerApi, (req, res)
     return;
   }
 
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
+    return;
+  }
+
   const thread = note.threads.find((t) => t.id === String(req.params.threadId));
   if (!thread) {
     res.status(404).json({ ok: false, error: "Thread not found." });
@@ -508,6 +612,10 @@ app.post("/api/notes/:id/threads/:threadId/replies", requireOwnerApi, (req, res)
 app.patch("/api/notes/:id/threads/:threadId", requireOwnerApi, (req, res) => {
   const note = notes.get(String(req.params.id));
   if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
+    return;
+  }
   const thread = note.threads.find((t) => t.id === String(req.params.threadId));
   if (!thread) { res.status(404).json({ ok: false, error: "Thread not found." }); return; }
   thread.resolved = Boolean(req.body.resolved);
@@ -593,11 +701,21 @@ app.get("/api/notes/:id", requireOwnerApi, (req, res) => {
     return;
   }
 
+  // ?annotated=1 returns the raw annotated markdown with `<!-- @path: ... -->`
+  // markers visible. Owner-session-only: agents read the visible projection so
+  // they cannot anchor edits to specific marker regions without owner consent.
+  const wantsAnnotated = String(req.query.annotated || "") === "1";
+  if (wantsAnnotated && !isOwnerSession(req)) {
+    res.status(403).json({ ok: false, error: "annotated-read-owner-only" });
+    return;
+  }
+
   const offset = req.query.offset ? Number(req.query.offset) : null;
   const limit = req.query.limit ? Number(req.query.limit) : null;
+  const sourceMarkdown = wantsAnnotated ? note.markdown : visibleMarkdown(note);
 
   if (offset !== null || limit !== null) {
-    const lines = note.markdown.split("\n");
+    const lines = sourceMarkdown.split("\n");
     const start = Math.max(0, (offset || 1) - 1);
     const end = limit ? Math.min(lines.length, start + limit) : lines.length;
     const slice = lines.slice(start, end);
@@ -619,7 +737,7 @@ app.get("/api/notes/:id", requireOwnerApi, (req, res) => {
     return;
   }
 
-  res.json({ ok: true, ...serializeNoteForClient(note, req) });
+  res.json({ ok: true, ...serializeNoteForClient(note, req, { annotated: wantsAnnotated }) });
 });
 
 app.put("/api/notes/:id", requireOwnerApi, (req, res) => {
@@ -702,83 +820,28 @@ app.post("/api/share/:shareId/edit", (req, res) => {
   const note = requireShareAccess(req, res, "edit");
   if (!note) return;
 
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentEditsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-edits-disabled" });
+    return;
+  }
+
   const edits = req.body.edits;
   if (!Array.isArray(edits) || edits.length === 0) {
     res.status(400).json({ ok: false, error: "edits must be a non-empty array of {oldText, newText}." });
     return;
   }
 
-  let workingCollab = note.collab;
-  let markdown = note.markdown;
-  let senderCounter = 0;
-  const errors: string[] = [];
-  const idListUpdates: ServerMutationMessage["idListUpdates"] = [];
-
-  for (let i = 0; i < edits.length; i++) {
-    const edit = edits[i];
-    const oldText = String(edit?.oldText || "");
-    const newText = String(edit?.newText || "");
-
-    if (!oldText) {
-      errors.push(`Edit ${i}: oldText is empty.`);
-      continue;
-    }
-
-    const firstIndex = markdown.indexOf(oldText);
-    if (firstIndex === -1) {
-      errors.push(`Edit ${i}: oldText not found.`);
-      continue;
-    }
-
-    const secondIndex = markdown.indexOf(oldText, firstIndex + 1);
-    if (secondIndex !== -1) {
-      errors.push(`Edit ${i}: oldText is ambiguous (found ${countOccurrences(markdown, oldText)} times).`);
-      continue;
-    }
-
-    let nextClientCounter = senderCounter + 1;
-    const mutations: ClientMutation[] = [];
-
-    if (oldText.length > 0) {
-      mutations.push({
-        name: "delete",
-        clientCounter: nextClientCounter++,
-        args: {
-          startId: idAtIndex(workingCollab, firstIndex),
-          endId: idAtIndex(workingCollab, firstIndex + oldText.length - 1),
-          contentLength: oldText.length,
-        },
-      });
-    }
-
-    if (newText.length > 0) {
-      mutations.push({
-        name: "insert",
-        clientCounter: nextClientCounter++,
-        args: {
-          before: firstIndex > 0 ? idBeforeIndex(workingCollab, firstIndex) : null,
-          id: { bunchId: crypto.randomUUID(), counter: 0 },
-          content: newText,
-          isInWord: false,
-        },
-      });
-    }
-
-    const result = applyClientMutations(workingCollab, mutations);
-    workingCollab = result.state;
-    markdown = result.markdown;
-    idListUpdates.push(...result.idListUpdates);
-    senderCounter = mutations.at(-1)?.clientCounter || senderCounter;
-  }
-
-  if (errors.length > 0) {
-    res.status(400).json({ ok: false, errors });
+  const applyResult = applyHttpEdits(note, edits);
+  if (!applyResult.ok) {
+    res.status(applyResult.status).json(applyResult.body);
     return;
   }
+  const { workingCollab, markdown, senderCounter, idListUpdates } = applyResult;
 
   note.collab = workingCollab;
   note.markdown = markdown;
   note.updatedAt = nowIso();
+  const markerChange = recomputeMarkerIds(note);
   persistNote(note, false);
 
   if (idListUpdates.length > 0) {
@@ -790,6 +853,9 @@ app.post("/api/share/:shareId/edit", (req, res) => {
       markdown: note.markdown,
       idListUpdates,
     });
+  }
+  if (markerChange.changed) {
+    broadcastMarkerIds(note);
   }
   broadcastNoteUpdate(note);
   res.json({ ok: true, savedAt: note.updatedAt });
@@ -813,14 +879,22 @@ app.get("/api/share/:shareId/note", (req, res) => {
   const note = requireShareAccess(req, res, "view");
   if (!note) return;
 
+  // Share path is owner-only-no-cookie territory: even owners reading via
+  // share don't get annotated markdown. Always return the visible projection.
+  if (String(req.query.annotated || "") === "1") {
+    res.status(403).json({ ok: false, error: "annotated-read-owner-only" });
+    return;
+  }
+
   res.json({
     ok: true,
     note: {
       id: note.id,
       title: note.title,
-      markdown: note.markdown,
+      markdown: visibleMarkdown(note),
       shareAccess: note.shareAccess,
       updatedAt: note.updatedAt,
+      confluence: publicConfluenceBinding(note) || null,
     },
     threads: serializeThreads(note, req),
   });
@@ -848,6 +922,11 @@ app.post("/api/share/:shareId/identity", (req, res) => {
 app.post("/api/share/:shareId/threads", (req, res) => {
   const note = requireShareAccess(req, res, "comment");
   if (!note) return;
+
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
+    return;
+  }
 
   const identity = ensureCommentAuthor(req, res);
   if (!identity) {
@@ -891,6 +970,11 @@ app.post("/api/share/:shareId/threads", (req, res) => {
 app.post("/api/share/:shareId/threads/:threadId/replies", (req, res) => {
   const note = requireShareAccess(req, res, "comment");
   if (!note) return;
+
+  if (note.confluence && !isOwnerSession(req) && !note.confluence.agentCommentsAllowed) {
+    res.status(403).json({ ok: false, error: "agent-comments-disabled" });
+    return;
+  }
 
   const thread = note.threads.find((item) => item.id === String(req.params.threadId));
   if (!thread) {
@@ -1035,6 +1119,309 @@ app.delete("/api/share/:shareId/messages/:messageId", (req, res) => {
   persistNote(note);
   broadcastThreadsUpdated(note);
   res.json({ ok: true, threads: serializeThreads(note, req) });
+});
+
+// --------------- Confluence integration ----------------
+
+app.get("/api/confluence/config", requireOwnerApi, (_req, res) => {
+  const configured = isConfluenceConfigured();
+  res.json({
+    ok: true,
+    configured,
+    baseUrl: configured ? getConfluenceBaseUrl() : null,
+    binResolved: Boolean(resolveConfluenceBin()),
+  });
+});
+
+app.post("/api/notes/confluence/import", requireOwnerApi, async (req, res) => {
+  if (!isOwnerSession(req)) {
+    // Import requires owner-cookie session. API keys are explicitly excluded
+    // because importing creates a new note and consumes deployment-level
+    // Confluence credentials.
+    res.status(403).json({ ok: false, error: "owner-only" });
+    return;
+  }
+  if (!isConfluenceConfigured()) {
+    res.status(400).json({ ok: false, error: "confluence-not-configured" });
+    return;
+  }
+  const pageId = String(req.body?.pageId || "").trim();
+  if (!pageId) {
+    res.status(400).json({ ok: false, error: "pageId is required" });
+    return;
+  }
+
+  try {
+    const rendered = await renderAnnotated(pageId);
+    let draft;
+    try {
+      draft = await hasDraft(pageId);
+    } catch {
+      draft = { exists: false, publishedVersion: rendered.version, draftVersion: null, title: rendered.title };
+    }
+
+    const timestamp = nowIso();
+    const id = createShortId();
+    const collab = collabFromMarkdown(rendered.markdown);
+    const baseUrl = getConfluenceBaseUrl() || "";
+    const binding: ConfluenceBinding = {
+      pageId,
+      baseUrl,
+      importedAt: timestamp,
+      lastKnownPublishedVersion: draft.publishedVersion || rendered.version,
+      lastKnownDraftVersion: draft.draftVersion,
+      lastPushedAt: timestamp,
+      lastPushedMarkdownSha256: sha256(rendered.markdown),
+      lastPushStatus: "idle",
+      lastPushError: null,
+      agentEditsAllowed: false,
+      agentCommentsAllowed: false,
+      history: [
+        {
+          at: timestamp,
+          by: describeAuthIdentity(req),
+          action: "import",
+          details: { pageId, version: rendered.version },
+        },
+      ],
+    };
+
+    const note: NoteRecord = {
+      id,
+      title: rendered.title.slice(0, 160) || "untitled",
+      shareId: createShortId(14),
+      shareAccess: "none",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      threads: [],
+      markdown: rendered.markdown,
+      collab,
+      clientAcks: new Map(),
+      confluence: binding,
+      markerIds: scanMarkerIds(collab),
+    };
+
+    notes.set(id, note);
+    persistNote(note);
+    res.json({ ok: true, noteId: id, confluence: publicConfluenceBinding(note) });
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      error: "import-failed",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.get("/api/notes/:id/confluence/status", requireOwnerApi, (req, res) => {
+  const note = notes.get(String(req.params.id));
+  if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
+  if (!note.confluence) { res.status(404).json({ ok: false, error: "not-confluence-bound" }); return; }
+  res.json({ ok: true, confluence: publicConfluenceBinding(note) });
+});
+
+app.patch("/api/notes/:id/confluence", requireOwnerApi, (req, res) => {
+  if (!isOwnerSession(req)) {
+    res.status(403).json({ ok: false, error: "owner-only" });
+    return;
+  }
+  const note = notes.get(String(req.params.id));
+  if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
+  if (!note.confluence) { res.status(404).json({ ok: false, error: "not-confluence-bound" }); return; }
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  let changed = false;
+  if (Object.prototype.hasOwnProperty.call(body, "agentEditsAllowed")) {
+    const next = Boolean(body.agentEditsAllowed);
+    if (next !== note.confluence.agentEditsAllowed) {
+      note.confluence.agentEditsAllowed = next;
+      appendConfluenceHistory(note, {
+        by: describeAuthIdentity(req),
+        action: "set-agent-edits-allowed",
+        details: { value: next },
+      });
+      changed = true;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "agentCommentsAllowed")) {
+    const next = Boolean(body.agentCommentsAllowed);
+    if (next !== note.confluence.agentCommentsAllowed) {
+      note.confluence.agentCommentsAllowed = next;
+      appendConfluenceHistory(note, {
+        by: describeAuthIdentity(req),
+        action: "set-agent-comments-allowed",
+        details: { value: next },
+      });
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    persistNote(note, false);
+    broadcastConfluenceMeta(note);
+  }
+  res.json({ ok: true, confluence: publicConfluenceBinding(note) });
+});
+
+app.post("/api/notes/:id/confluence/push", requireOwnerApi, async (req, res) => {
+  if (!isOwnerSession(req)) {
+    res.status(403).json({ ok: false, error: "owner-only" });
+    return;
+  }
+  const note = notes.get(String(req.params.id));
+  if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
+  if (!note.confluence) { res.status(404).json({ ok: false, error: "not-confluence-bound" }); return; }
+  if (note.confluence.lastPushStatus === "pushing") {
+    res.status(409).json({ ok: false, error: "already-pushing" });
+    return;
+  }
+
+  const binding = note.confluence;
+  binding.lastPushStatus = "pushing";
+  binding.lastPushError = null;
+  persistNote(note, false);
+  broadcastConfluenceMeta(note);
+  broadcastConfluencePush(note, {
+    type: "confluence-push",
+    noteId: note.id,
+    pageId: binding.pageId,
+    status: "pushing",
+  });
+
+  const markdownToPush = note.markdown;
+  let ack: ServerConfluencePushMessage;
+  try {
+    const result = await applyAnnotated(binding.pageId, markdownToPush);
+    if (result.ok) {
+      const newVersion = result.newVersion || binding.lastKnownDraftVersion || binding.lastKnownPublishedVersion;
+      if (result.appliedCount > 0) {
+        binding.lastKnownDraftVersion = newVersion;
+      }
+      binding.lastPushedAt = nowIso();
+      binding.lastPushedMarkdownSha256 = sha256(markdownToPush);
+      binding.lastPushStatus = "pushed";
+      binding.lastPushError = null;
+      appendConfluenceHistory(note, {
+        by: describeAuthIdentity(req),
+        action: "publish",
+        details: {
+          appliedCount: result.appliedCount,
+          oldVersion: result.oldVersion,
+          newVersion,
+        },
+      });
+      ack = {
+        type: "confluence-push",
+        noteId: note.id,
+        pageId: binding.pageId,
+        status: "pushed",
+        appliedCount: result.appliedCount,
+        oldVersion: result.oldVersion,
+        newVersion,
+        lastPushedAt: binding.lastPushedAt,
+      };
+    } else {
+      const isConflict = result.kind === "fetch-conflict" || result.kind === "draft-conflict";
+      binding.lastPushStatus = isConflict ? "conflict" : "error";
+      binding.lastPushError = result.stderr.trim() || result.stdout.trim() || result.kind;
+      appendConfluenceHistory(note, {
+        by: describeAuthIdentity(req),
+        action: "publish-failed",
+        details: { kind: result.kind },
+      });
+      ack = {
+        type: "confluence-push",
+        noteId: note.id,
+        pageId: binding.pageId,
+        status: binding.lastPushStatus,
+        errorKind: result.kind,
+        errorMessage: binding.lastPushError,
+      };
+    }
+  } catch (error) {
+    binding.lastPushStatus = "error";
+    binding.lastPushError = error instanceof Error ? error.message : String(error);
+    appendConfluenceHistory(note, {
+      by: describeAuthIdentity(req),
+      action: "publish-failed",
+      details: { kind: "crash" },
+    });
+    ack = {
+      type: "confluence-push",
+      noteId: note.id,
+      pageId: binding.pageId,
+      status: "error",
+      errorKind: "crash",
+      errorMessage: binding.lastPushError,
+    };
+  }
+
+  persistNote(note, false);
+  broadcastConfluenceMeta(note);
+  broadcastConfluencePush(note, ack);
+
+  if (ack.status === "pushed") {
+    res.json({ ok: true, confluence: publicConfluenceBinding(note), result: ack });
+  } else {
+    res.status(ack.errorKind === "crash" || ack.errorKind === "config" ? 502 : 409)
+      .json({ ok: false, confluence: publicConfluenceBinding(note), result: ack });
+  }
+});
+
+app.post("/api/notes/:id/confluence/refresh", requireOwnerApi, async (req, res) => {
+  if (!isOwnerSession(req)) {
+    res.status(403).json({ ok: false, error: "owner-only" });
+    return;
+  }
+  const note = notes.get(String(req.params.id));
+  if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
+  if (!note.confluence) { res.status(404).json({ ok: false, error: "not-confluence-bound" }); return; }
+
+  const binding = note.confluence;
+  const force = Boolean(req.body?.force);
+  const currentSha = sha256(note.markdown);
+  if (!force && binding.lastPushedMarkdownSha256 !== null && currentSha !== binding.lastPushedMarkdownSha256) {
+    res.status(409).json({ ok: false, error: "local-edits-would-be-lost" });
+    return;
+  }
+
+  try {
+    const rendered = await renderAnnotated(binding.pageId);
+    let draft;
+    try { draft = await hasDraft(binding.pageId); } catch { draft = { exists: false, publishedVersion: rendered.version, draftVersion: null, title: rendered.title }; }
+
+    const nextCounter = note.collab.serverCounter + 1;
+    note.collab = collabFromMarkdown(rendered.markdown, nextCounter);
+    note.markdown = rendered.markdown;
+    note.title = rendered.title.slice(0, 160) || note.title;
+    binding.lastKnownPublishedVersion = draft.publishedVersion || rendered.version;
+    binding.lastKnownDraftVersion = draft.draftVersion;
+    binding.lastPushedMarkdownSha256 = sha256(rendered.markdown);
+    binding.lastPushStatus = "idle";
+    binding.lastPushError = null;
+    binding.lastPushedAt = nowIso();
+    note.markerIds = scanMarkerIds(note.collab);
+    note.clientAcks.clear();
+    note.updatedAt = nowIso();
+
+    appendConfluenceHistory(note, {
+      by: describeAuthIdentity(req),
+      action: "refresh",
+      details: { force, version: rendered.version },
+    });
+
+    persistNote(note, false);
+    broadcastEditorHello(note);
+    broadcastConfluenceRefresh(note);
+    broadcastNoteUpdate(note);
+    res.json({ ok: true, confluence: publicConfluenceBinding(note) });
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      error: "refresh-failed",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 app.use((_req, res) => {
@@ -1198,6 +1585,18 @@ function handleEditorMessage(conn: ClientConn, data: string) {
   const lastAcknowledgedCounter = note.clientAcks.get(mutationMsg.clientId) || 0;
   const freshMutations = mutationMsg.mutations.filter((mutation) => mutation.clientCounter > lastAcknowledgedCounter);
 
+  if (note.confluence && note.markerIds.size > 0) {
+    for (const mutation of freshMutations) {
+      const verdict = validateMutationAgainstMarkers(note.collab, mutation, note.markerIds);
+      if (!verdict.ok) {
+        // Reject by replaying the canonical state to this client. We do not
+        // ack the bad clientCounters, so the client will resync.
+        sendServerMessage(conn.ws, { ...buildHelloMessage(note), clientId: conn.clientId });
+        return;
+      }
+    }
+  }
+
   if (freshMutations.length === 0) {
     sendServerMessage(conn.ws, {
       type: "mutation",
@@ -1235,6 +1634,7 @@ function handleEditorMessage(conn: ClientConn, data: string) {
   note.collab = result.state;
   note.markdown = result.markdown;
   note.updatedAt = nowIso();
+  const markerChange = recomputeMarkerIds(note);
   persistNote(note, false);
 
   broadcastEditorMutation(note, {
@@ -1245,10 +1645,23 @@ function handleEditorMessage(conn: ClientConn, data: string) {
     markdown: note.markdown,
     idListUpdates: result.idListUpdates,
   });
+  if (markerChange.changed) {
+    broadcastMarkerIds(note);
+  }
   broadcastNoteUpdate(note);
 }
 
-type AnyServerMessage = (ServerHelloMessage & { clientId?: string }) | ServerMutationMessage | ServerPresenceMessage | ServerPresenceLeaveMessage | { type: "updated"; noteId: string; shareId: string; updatedAt: string } | { type: "threads-updated"; noteId: string; shareId: string };
+type AnyServerMessage =
+  | (ServerHelloMessage & { clientId?: string })
+  | ServerMutationMessage
+  | ServerPresenceMessage
+  | ServerPresenceLeaveMessage
+  | { type: "updated"; noteId: string; shareId: string; updatedAt: string }
+  | { type: "threads-updated"; noteId: string; shareId: string }
+  | ServerConfluencePushMessage
+  | ServerConfluenceRefreshMessage
+  | ServerConfluenceMetaMessage
+  | ServerMarkerUpdateMessage;
 
 function sendServerMessage(ws: WebSocket, message: AnyServerMessage) {
   if (ws.readyState === 1) {
@@ -1257,7 +1670,7 @@ function sendServerMessage(ws: WebSocket, message: AnyServerMessage) {
 }
 
 function buildHelloMessage(note: NoteRecord): ServerHelloMessage {
-  return {
+  const message: ServerHelloMessage = {
     type: "hello",
     noteId: note.id,
     title: note.title,
@@ -1266,6 +1679,12 @@ function buildHelloMessage(note: NoteRecord): ServerHelloMessage {
     idListState: saveCollabState(note.collab).idListState,
     serverCounter: note.collab.serverCounter,
   };
+  const confluence = publicConfluenceBinding(note);
+  if (confluence) {
+    message.confluence = confluence;
+    message.markerCharKeys = [...note.markerIds];
+  }
+  return message;
 }
 
 function sendExistingPresence(target: ClientConn) {
@@ -1311,6 +1730,55 @@ function enforceShareAccessForConnections(note: NoteRecord) {
     }
     if (conn.kind === "public-viewer" && note.shareAccess === "none") {
       try { conn.ws.close(); } catch {}
+    }
+  }
+}
+
+function broadcastConfluencePush(note: NoteRecord, message: ServerConfluencePushMessage) {
+  for (const conn of clients) {
+    if (conn.kind === "editor" && conn.noteId === note.id) {
+      sendServerMessage(conn.ws, message);
+    }
+  }
+}
+
+function broadcastConfluenceMeta(note: NoteRecord) {
+  if (!note.confluence) return;
+  const message: ServerConfluenceMetaMessage = {
+    type: "confluence-meta",
+    noteId: note.id,
+    confluence: publicConfluenceBinding(note)!,
+  };
+  for (const conn of clients) {
+    if (conn.kind === "editor" && conn.noteId === note.id) {
+      sendServerMessage(conn.ws, message);
+    }
+  }
+}
+
+function broadcastConfluenceRefresh(note: NoteRecord) {
+  if (!note.confluence) return;
+  const message: ServerConfluenceRefreshMessage = {
+    type: "confluence-refresh",
+    noteId: note.id,
+    pageId: note.confluence.pageId,
+  };
+  for (const conn of clients) {
+    if (conn.kind === "editor" && conn.noteId === note.id) {
+      sendServerMessage(conn.ws, message);
+    }
+  }
+}
+
+function broadcastMarkerIds(note: NoteRecord) {
+  const message: ServerMarkerUpdateMessage = {
+    type: "marker-ids",
+    noteId: note.id,
+    markerCharKeys: [...note.markerIds],
+  };
+  for (const conn of clients) {
+    if (conn.kind === "editor" && conn.noteId === note.id) {
+      sendServerMessage(conn.ws, message);
     }
   }
 }
@@ -1416,15 +1884,49 @@ function loadNotesIntoMemory() {
       collab = collabFromMarkdown(markdown);
     }
 
-    notes.set(id, {
+    let confluence: ConfluenceBinding | undefined;
+    if (meta.confluence) {
+      confluence = normalizeConfluenceBinding(meta.confluence);
+      // Recover from a server crash mid-push: any "pushing" status on disk is
+      // stale because the previous process did not finish the apply round-trip.
+      if (confluence.lastPushStatus === "pushing") {
+        confluence.lastPushStatus = "error";
+        confluence.lastPushError = "interrupted: server restarted while pushing";
+      }
+    }
+
+    const note: NoteRecord = {
       ...meta,
       shareAccess: (meta.shareAccess as ShareAccess) || "none",
       markdown: collabToMarkdown(collab),
       threads,
       collab,
       clientAcks: new Map(),
-    });
+      confluence,
+      markerIds: confluence ? scanMarkerIds(collab) : new Set<string>(),
+    };
+    notes.set(id, note);
   }
+}
+
+function normalizeConfluenceBinding(input: ConfluenceBinding): ConfluenceBinding {
+  return {
+    pageId: input.pageId,
+    baseUrl: input.baseUrl,
+    importedAt: input.importedAt,
+    lastKnownPublishedVersion: Number(input.lastKnownPublishedVersion) || 0,
+    lastKnownDraftVersion:
+      input.lastKnownDraftVersion === null || input.lastKnownDraftVersion === undefined
+        ? null
+        : Number(input.lastKnownDraftVersion),
+    lastPushedAt: input.lastPushedAt ?? null,
+    lastPushedMarkdownSha256: input.lastPushedMarkdownSha256 ?? null,
+    lastPushStatus: (input.lastPushStatus as ConfluenceBinding["lastPushStatus"]) || "idle",
+    lastPushError: input.lastPushError ?? null,
+    agentEditsAllowed: Boolean(input.agentEditsAllowed),
+    agentCommentsAllowed: Boolean(input.agentCommentsAllowed),
+    history: Array.isArray(input.history) ? input.history.slice(-200) : [],
+  };
 }
 
 function noteMarkdownPath(id: string) {
@@ -1461,6 +1963,7 @@ function createNote() {
     threads: [],
     collab: newCollabState(),
     clientAcks: new Map(),
+    markerIds: new Set<string>(),
   };
 
   notes.set(id, note);
@@ -1480,6 +1983,7 @@ function persistNote(note: NoteRecord, broadcastUpdate = true) {
     updatedAt: note.updatedAt,
     threads: note.threads,
     collab: saveCollabState(note.collab),
+    confluence: note.confluence,
   };
 
   fs.writeFileSync(noteMarkdownPath(note.id), note.markdown, "utf8");
@@ -1487,6 +1991,86 @@ function persistNote(note: NoteRecord, broadcastUpdate = true) {
   if (broadcastUpdate) {
     broadcastNoteUpdate(note);
   }
+}
+
+function recomputeMarkerIds(note: NoteRecord): { changed: boolean } {
+  if (!note.confluence) {
+    if (note.markerIds.size === 0) return { changed: false };
+    note.markerIds = new Set();
+    return { changed: true };
+  }
+  const next = scanMarkerIds(note.collab);
+  if (next.size === note.markerIds.size) {
+    let same = true;
+    for (const key of next) {
+      if (!note.markerIds.has(key)) { same = false; break; }
+    }
+    if (same) return { changed: false };
+  }
+  note.markerIds = next;
+  return { changed: true };
+}
+
+function visibleMarkdown(note: NoteRecord): string {
+  if (!note.confluence || note.markerIds.size === 0) return note.markdown;
+  const parts: string[] = [];
+  let i = 0;
+  for (const id of note.collab.idList.values()) {
+    const ch = note.collab.chars.get(`${id.bunchId}:${id.counter}`);
+    if (ch === undefined) { i++; continue; }
+    if (note.markerIds.has(`${id.bunchId}:${id.counter}`)) { i++; continue; }
+    parts.push(ch);
+    i++;
+  }
+  return parts.join("");
+}
+
+function publicConfluenceBinding(note: NoteRecord): ConfluenceBindingPublic | undefined {
+  if (!note.confluence) return undefined;
+  const c = note.confluence;
+  return {
+    pageId: c.pageId,
+    baseUrl: c.baseUrl,
+    importedAt: c.importedAt,
+    lastKnownPublishedVersion: c.lastKnownPublishedVersion,
+    lastKnownDraftVersion: c.lastKnownDraftVersion,
+    lastPushedAt: c.lastPushedAt,
+    lastPushStatus: c.lastPushStatus,
+    lastPushError: c.lastPushError,
+    agentEditsAllowed: c.agentEditsAllowed,
+    agentCommentsAllowed: c.agentCommentsAllowed,
+    hasUnpushedEdits: hasUnpushedEdits(note),
+  };
+}
+
+function hasUnpushedEdits(note: NoteRecord): boolean {
+  if (!note.confluence) return false;
+  if (note.confluence.lastPushedMarkdownSha256 === null) return note.markdown.length > 0;
+  return sha256(note.markdown) !== note.confluence.lastPushedMarkdownSha256;
+}
+
+function sha256(value: string): string {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function appendConfluenceHistory(
+  note: NoteRecord,
+  entry: Omit<ConfluenceHistoryEntry, "at">,
+) {
+  if (!note.confluence) return;
+  note.confluence.history = [...note.confluence.history, { at: nowIso(), ...entry }].slice(-200);
+}
+
+function describeAuthIdentity(req: Request): string {
+  const bearer = getBearerToken(req);
+  if (bearer) {
+    const label = getApiKeyLabel(bearer);
+    if (label) return `api-key:${label}`;
+  }
+  if (isOwnerAuthenticated(req)) return "owner";
+  const commenter = getCommenterIdentity(req);
+  if (commenter.id) return `share:${commenter.name || "anonymous"}`;
+  return "unknown";
 }
 
 function searchNotes(query: string) {
@@ -1602,18 +2186,25 @@ function serializeThreads(note: NoteRecord, req: Request) {
   }));
 }
 
-function serializeNoteForClient(note: NoteRecord, req: Request) {
+function serializeNoteForClient(
+  note: NoteRecord,
+  req: Request,
+  opts: { annotated?: boolean } = {},
+) {
+  const visible = visibleMarkdown(note);
+  const md = opts.annotated ? note.markdown : visible;
   return {
     note: {
       id: note.id,
       title: note.title,
-      markdown: note.markdown,
-      renderedHtml: renderMarkdown(note.markdown),
+      markdown: md,
+      renderedHtml: renderMarkdown(visible),
       shareId: note.shareId,
       shareAccess: note.shareAccess,
       shareUrl: makeShareUrl(req, note.shareId),
       updatedAt: note.updatedAt,
       createdAt: note.createdAt,
+      confluence: publicConfluenceBinding(note) || null,
     },
     viewer: buildViewerInfo(req),
     threads: serializeThreads(note, req),
@@ -1945,6 +2536,15 @@ function isOwnerAuthenticatedHeaders(headers: http.IncomingHttpHeaders) {
 
 function isOwnerAuthenticated(req: Request) {
   return isOwnerAuthenticatedHeaders(req.headers);
+}
+
+// Owner-via-session-cookie. Used to distinguish browser-UI owner ("the human
+// who owns this jot instance is sitting in front of it") from API-key-bearing
+// callers ("an agent is calling jot's HTTP surface"). Confluence-bound notes
+// gate agent identities behind per-note opt-in flags; this helper is the gate.
+function isOwnerSession(req: Request): boolean {
+  const token = getOwnerSessionToken(req);
+  return Boolean(token && verifyOwnerToken(token));
 }
 
 function isOwnerAuthenticatedIncomingRequest(req: http.IncomingMessage) {
