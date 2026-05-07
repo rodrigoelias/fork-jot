@@ -254,6 +254,47 @@ surface a clear error when the per-note flag is off. **`jot publish` and
 `jot refresh` are intentionally not provided** — the owner publishes from
 the UI deliberately.
 
+## Next steps
+
+The v1 implementation lands the full server-side surface (validator, gated
+routes, audit log) and a minimal-but-functional UI. The following are
+deliberate v1 deferrals, ordered roughly by user impact:
+
+- **Hide markers in the live textarea.** The server-side visible projection
+  is in place (`GET /api/notes/:id` and the share endpoints already strip
+  markers), but the textarea still shows raw `<!-- @path:... -->` markers
+  while editing. Building the textarea-side projection requires rewriting
+  the offset ↔ ElementId translation throughout `public/collab-editor.js`
+  to skip marker chars when reading `selectionStart` / `selectionEnd` and
+  when calling `idList.at()`. The helpers (`buildMarkerKeySet`,
+  `visibleLengthBefore`) are already exported from `collab-shared.js`.
+- **Two-way comment sync** between jot threads and Confluence inline
+  annotations. Comments stay local in v1; this also needs new endpoints in
+  `confluence-adf`.
+- **Path-anchored agent edit verbs** (e.g. `POST /edit?path=42` mapping to
+  `confluence-adf edit <pathId> replace`) for surgical agent edits without
+  ambiguity. v1 keeps `/api/notes/:id/edit` text-based and lets the marker
+  validator + visible projection do the rest.
+- **Incremental marker recompute.** `scanMarkerIds` is currently O(N) per
+  accepted mutation. For very large pages, walk only the affected range.
+- **3-way merge on refresh.** v1 is replace-with-confirm; a real merge
+  would need to keep ElementIds stable across the swap.
+- **Rich rendering of ADF-only nodes** (panels, expand, layoutSection,
+  status). They render as fenced markdown today.
+- **Live Confluence-side change notifications.** v1 is manual Refresh.
+- **Per-user Confluence tokens / OAuth / multi-tenant auth.** v1 is single
+  deployment service account.
+- **`--json` flags upstream in `confluence-adf`.** v1 parses regex over
+  stable stdout lines (`<!-- applied N edit(s) ... v<old> -> v<new>
+  (draft) -->` and `No changes detected.`). A `--json` contribution to
+  `confluence-adf` would be a small but useful upstream improvement.
+- **Unit tests for the marker validator and subprocess wrapper.** Smoke
+  tests pass; the seams (`scanMarkerIds`, `validateMutationAgainstMarkers`,
+  `confluence.ts` regex parsers) are pure functions ready for fixtures
+  when a test runner is added to the repo.
+- **Rate limits on agent endpoints.** A misbehaving agent can hammer
+  `/api/notes/:id/edit`. Add a per-key throttle.
+
 ## License
 
 MIT
