@@ -1134,13 +1134,6 @@ app.get("/api/confluence/config", requireOwnerApi, (_req, res) => {
 });
 
 app.post("/api/notes/confluence/import", requireOwnerApi, async (req, res) => {
-  if (!isOwnerSession(req)) {
-    // Import requires owner-cookie session. API keys are explicitly excluded
-    // because importing creates a new note and consumes deployment-level
-    // Confluence credentials.
-    res.status(403).json({ ok: false, error: "owner-only" });
-    return;
-  }
   if (!isConfluenceConfigured()) {
     res.status(400).json({ ok: false, error: "confluence-not-configured" });
     return;
@@ -1221,10 +1214,6 @@ app.get("/api/notes/:id/confluence/status", requireOwnerApi, (req, res) => {
 });
 
 app.patch("/api/notes/:id/confluence", requireOwnerApi, (req, res) => {
-  if (!isOwnerSession(req)) {
-    res.status(403).json({ ok: false, error: "owner-only" });
-    return;
-  }
   const note = notes.get(String(req.params.id));
   if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
   if (!note.confluence) { res.status(404).json({ ok: false, error: "not-confluence-bound" }); return; }
@@ -1264,10 +1253,6 @@ app.patch("/api/notes/:id/confluence", requireOwnerApi, (req, res) => {
 });
 
 app.post("/api/notes/:id/confluence/push", requireOwnerApi, async (req, res) => {
-  if (!isOwnerSession(req)) {
-    res.status(403).json({ ok: false, error: "owner-only" });
-    return;
-  }
   const note = notes.get(String(req.params.id));
   if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
   if (!note.confluence) { res.status(404).json({ ok: false, error: "not-confluence-bound" }); return; }
@@ -1369,10 +1354,6 @@ app.post("/api/notes/:id/confluence/push", requireOwnerApi, async (req, res) => 
 });
 
 app.post("/api/notes/:id/confluence/refresh", requireOwnerApi, async (req, res) => {
-  if (!isOwnerSession(req)) {
-    res.status(403).json({ ok: false, error: "owner-only" });
-    return;
-  }
   const note = notes.get(String(req.params.id));
   if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
   if (!note.confluence) { res.status(404).json({ ok: false, error: "not-confluence-bound" }); return; }
