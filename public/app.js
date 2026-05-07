@@ -464,7 +464,7 @@
           },
           onConfluenceMeta: (msg) => { window.__confluenceHandleMeta?.(refs, msg); },
           onConfluencePush: (msg) => { window.__confluenceHandlePush?.(refs, msg); },
-          onConfluenceRefresh: () => { /* fresh hello will follow */ },
+          onConfluenceRefresh: () => { setSaveStatus(refs, "Refreshing from Confluence…"); },
           onMarkerGuard: (info) => {
             setSaveStatus(refs, info.kind === "insert"
               ? "Edit blocked: inside a Confluence marker"
@@ -480,9 +480,14 @@
 
     if (titleInput) {
       let titleSaveTimer = null;
+      let titleConfluenceWarned = false;
       titleInput.addEventListener("input", () => {
         if (!state.note) {
           return;
+        }
+        if (state.note.confluence && !titleConfluenceWarned) {
+          titleConfluenceWarned = true;
+          setSaveStatus(refs, "Title changes don't sync to Confluence");
         }
         state.note.title = titleInput.value;
         clearTimeout(titleSaveTimer);
@@ -761,6 +766,8 @@
       state.viewer = payload.viewer;
       state.threads = payload.threads;
       renderConfluencePanel(refsArg, payload.note?.confluence || null, payload.viewer?.isOwner);
+      // Expose for outside-closure callers (e.g. openConfluenceConflictModal).
+      window.__applyNotePayload = applyNotePayload;
 
       if (refsArg.topbarTitle) {
         refsArg.topbarTitle.textContent = payload.note.title || "untitled";
@@ -932,11 +939,11 @@
     if (refs.saveStatus) {
       refs.saveStatus.textContent = value;
       refs.saveStatus.classList.remove("status-fade");
-      if (value === "Saved") {
+      if (value && value !== "Disconnected") {
         clearTimeout(state.statusFadeTimer);
         state.statusFadeTimer = setTimeout(() => {
           refs.saveStatus.classList.add("status-fade");
-        }, 1500);
+        }, value === "Saved" ? 1500 : 4000);
       }
     }
   }
@@ -1061,6 +1068,16 @@
       lines.push(
         `# Your user wants you to interact with a shared jot note using the CLI below.`,
         `# Run the commands as needed to read, edit, and comment on the note.`,
+      );
+      if (confluence) {
+        lines.push(
+          `# This note is bound to Confluence page ${confluence.pageId}.`,
+          `# Reads are always allowed.`,
+          `# Edits are ${editsAllowed ? "ENABLED" : "DISABLED"}; comments are ${commentsAllowed ? "ENABLED" : "DISABLED"}.`,
+          `# Publishing back to Confluence is owner-only.`,
+        );
+      }
+      lines.push(
         ``,
         `npm install -g @mariozechner/jot`,
         ``,
@@ -1069,15 +1086,25 @@
         ``,
         `# Read the note (includes thread/message IDs)`,
         `jot my-jot read`,
-        ``,
-        `# Edit the note (if edit access)`,
-        `jot my-jot edit '[{"oldText":"...","newText":"..."}]'`,
-        ``,
-        `# Comment on text`,
-        `jot my-jot comment "quoted text" "comment body" --name="My Agent"`,
-        ``,
-        `# Reply to a specific message`,
-        `jot my-jot reply <thread-id> <message-id> "reply" --name="My Agent"`,
+      );
+      if (editsAllowed) {
+        lines.push(
+          ``,
+          `# Edit the note (if edit access)`,
+          `jot my-jot edit '[{"oldText":"...","newText":"..."}]'`,
+        );
+      }
+      if (commentsAllowed) {
+        lines.push(
+          ``,
+          `# Comment on text`,
+          `jot my-jot comment "quoted text" "comment body" --name="My Agent"`,
+          ``,
+          `# Reply to a specific message`,
+          `jot my-jot reply <thread-id> <message-id> "reply" --name="My Agent"`,
+        );
+      }
+      lines.push(
         ``,
         `# Full command reference`,
         `jot --help`,
@@ -1971,7 +1998,7 @@
         </div>
         <p>Paste a Confluence page ID. The page will be imported as a jot note bound to that page; nothing is published back to Confluence until you click Publish.</p>
         <input id="confluencePageIdInput" type="text" placeholder="page id" autocomplete="off" style="width:100%;padding:8px;margin:8px 0;" />
-        <p id="confluenceImportError" class="confluence-import-error" style="color:#c33;display:none;"></p>
+        <p id="confluenceImportError" class="confluence-import-error" style="color:var(--danger,#c33);display:none;"></p>
         <div style="display:flex;gap:8px;justify-content:flex-end;">
           <jot-button variant="ghost" size="sm" id="confluenceImportCancel">cancel</jot-button>
           <jot-button variant="primary" size="sm" id="confluenceImportSubmit">import</jot-button>
@@ -2068,6 +2095,9 @@
   async function publishConfluence(refs) {
     const noteId = state.note?.id;
     if (!noteId) return;
+    const btn = document.getElementById("confluencePublishBtn");
+    if (btn?.hasAttribute("disabled")) return;
+    if (btn) btn.setAttribute("disabled", "true");
     try {
       const response = await fetch(`/api/notes/${noteId}/confluence/push`, { method: "POST", headers: { "Content-Type": "application/json" } });
       const payload = await response.json().catch(() => ({}));
@@ -2086,12 +2116,17 @@
       }
     } catch (error) {
       alert(`Publish failed: ${error.message || error}`);
+    } finally {
+      if (btn) btn.removeAttribute("disabled");
     }
   }
 
   async function refreshConfluence(refs, force) {
     const noteId = state.note?.id;
     if (!noteId) return;
+    const btn = document.getElementById("confluenceRefreshBtn");
+    if (btn?.hasAttribute("disabled")) return;
+    if (btn) btn.setAttribute("disabled", "true");
     try {
       const response = await fetch(`/api/notes/${noteId}/confluence/refresh`, {
         method: "POST",
@@ -2104,6 +2139,7 @@
         renderConfluencePanel(refs, payload.confluence, state.viewer?.isOwner);
       } else if (response.status === 409 && payload.error === "local-edits-would-be-lost") {
         if (confirm("Discard server-side edits and reload from Confluence?")) {
+          if (btn) btn.removeAttribute("disabled");
           await refreshConfluence(refs, true);
         }
       } else {
@@ -2111,6 +2147,8 @@
       }
     } catch (error) {
       alert(`Refresh failed: ${error.message || error}`);
+    } finally {
+      if (btn) btn.removeAttribute("disabled");
     }
   }
 
@@ -2125,7 +2163,7 @@
           <jot-icon-button icon="close" label="Close" id="confluenceConflictClose"></jot-icon-button>
         </div>
         <p>Confluence rejected the publish: <strong>${escapeHtml(result.errorKind || "unknown")}</strong></p>
-        <pre style="background:var(--bg-elevated,rgba(0,0,0,0.2));padding:8px;font-size:11px;white-space:pre-wrap;max-height:200px;overflow:auto;">${escapeHtml(result.errorMessage || "")}</pre>
+        <pre style="background:var(--code-bg,rgba(0,0,0,0.2));padding:8px;font-size:11px;white-space:pre-wrap;max-height:200px;overflow:auto;">${escapeHtml(result.errorMessage || "")}</pre>
         <div style="display:flex;gap:8px;justify-content:flex-end;">
           <jot-button variant="ghost" size="sm" id="confluenceConflictDismiss">dismiss</jot-button>
           <jot-button variant="primary" size="sm" id="confluenceConflictForce">refresh (forced)</jot-button>
@@ -2138,6 +2176,13 @@
     refs.modalBackdrop.querySelector("#confluenceConflictForce").addEventListener("click", async () => {
       close();
       await refreshConfluence(refs, true);
+      // Force a REST reload so the buffer updates even if WS is mid-reconnect.
+      try {
+        if (typeof window.__applyNotePayload === "function" && state.note?.id) {
+          const payload = await api(`/api/notes/${state.note.id}`);
+          window.__applyNotePayload(payload, refs, false);
+        }
+      } catch {}
     });
     refs.modalBackdrop.addEventListener("click", (e) => { if (e.target === refs.modalBackdrop) close(); });
   }
@@ -2190,6 +2235,9 @@
         if (response.ok && payload.ok && state.note) {
           state.note.confluence = payload.confluence;
           renderConfluencePanel(refs, payload.confluence, true);
+          // Re-bind in case the server coerced or rejected.
+          editsBox.checked = payload.confluence.agentEditsAllowed;
+          commentsBox.checked = payload.confluence.agentCommentsAllowed;
         }
       } catch {}
     };
@@ -2200,6 +2248,9 @@
   // Hooks invoked by initNotePage so the Confluence WS messages can reach the
   // panel.
   window.__confluenceHandleHello = function (refs, payload) {
+    // Anti-flicker: don't paint over a non-null binding with a transient
+    // null hello (e.g., a stale reconnect that races a fresh REST load).
+    if (payload.confluence === null && state.note?.confluence) return;
     if (state.note) state.note.confluence = payload.confluence || null;
     renderConfluencePanel(refs, payload.confluence || null, state.viewer?.isOwner);
   };
