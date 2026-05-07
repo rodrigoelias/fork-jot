@@ -61,6 +61,20 @@ async function request(instance, method, endpoint, body) {
       hint = " (the edit overlaps a Confluence ADF marker; pick a different oldText)";
     } else if (code === "owner-only") {
       hint = " (this action requires owner access; only the human owner can publish/refresh from the UI)";
+    } else if (code === "not-confluence-bound") {
+      hint = " (this note is not bound to a Confluence page; only Confluence-bound notes have a status)";
+    } else if (code === "confluence-not-configured") {
+      hint = " (this jot deployment isn't configured for Confluence; ask the operator to set CONFLUENCE_BASE_URL/EMAIL/API_TOKEN)";
+    } else if (code === "annotated-read-owner-only") {
+      hint = " (?annotated=1 is owner-cookie-only and not available to API keys or share-link callers)";
+    } else if (code === "local-edits-would-be-lost") {
+      hint = " (local server-side edits would be lost; pass force=true (server-side flag) only after confirming with the owner)";
+    } else if (code === "already-pushing") {
+      hint = " (another publish is in flight for this note; retry once it settles)";
+    } else if (code === "import-failed") {
+      hint = " (confluence-adf failed to render the page; check the page id and credentials)";
+    } else if (code === "refresh-failed") {
+      hint = " (confluence-adf failed to render the page during refresh; check connectivity and credentials)";
     }
     console.error(`Error ${response.status}: ${code}${hint}`);
     process.exit(1);
@@ -243,9 +257,25 @@ if (isShareInstance(instance)) {
       break;
     }
 
+    case "status": {
+      const payload = await request(instance, "GET", `/api/share/${sid}/confluence/status`);
+      const c = payload.confluence;
+      console.log(`pageId: ${c.pageId}`);
+      console.log(`baseUrl: ${c.baseUrl}`);
+      console.log(`publishedVersion: ${c.lastKnownPublishedVersion}`);
+      console.log(`draftVersion: ${c.lastKnownDraftVersion ?? "(none)"}`);
+      console.log(`lastPushedAt: ${c.lastPushedAt ?? "(never)"}`);
+      console.log(`lastPushStatus: ${c.lastPushStatus}`);
+      if (c.lastPushError) console.log(`lastPushError: ${c.lastPushError}`);
+      console.log(`hasUnpushedEdits: ${c.hasUnpushedEdits}`);
+      console.log(`agentEditsAllowed: ${c.agentEditsAllowed}`);
+      console.log(`agentCommentsAllowed: ${c.agentCommentsAllowed}`);
+      break;
+    }
+
     default:
       console.error(`Unknown command for shared instance: ${subCommand}`);
-      console.error("Available: read, edit, comment, reply");
+      console.error("Available: read, edit, comment, reply, status");
       process.exit(1);
   }
 } else {

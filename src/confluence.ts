@@ -219,9 +219,14 @@ export async function applyAnnotated(
 ): Promise<ApplyResult> {
   const tmpDir = opts.tempDir || (process.env.TMPDIR || "/tmp");
   fs.mkdirSync(tmpDir, { recursive: true });
+  // Defense-in-depth: sanitize pageId before interpolating into the tempfile
+  // name so a malformed/malicious pageId can't induce path traversal in /tmp.
+  // The CLI args below still pass the original pageId so confluence-adf sees
+  // the real id.
+  const safePageId = String(pageId).replace(/[^A-Za-z0-9_-]/g, "_");
   const tempfile = path.join(
     tmpDir,
-    `jot-push-${pageId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.md`,
+    `jot-push-${safePageId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.md`,
   );
   const fd = fs.openSync(tempfile, "wx", 0o600);
   try {

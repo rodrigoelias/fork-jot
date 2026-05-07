@@ -212,12 +212,27 @@ export function charKey(id: ElementId) {
   return `${id.bunchId}:${id.counter}`;
 }
 
+export type MarkerScan = {
+  charKeys: Set<string>;
+  // For each marker char, which run (regex match index) it belongs to.
+  runIds: Map<string, number>;
+};
+
 // Scan the live buffer for `<!-- @path:...-->` regions and return the set of
 // charKeys that fall inside any marker (including the opening "<!-- @path:" and
 // the closing "-->"). Used by both the server-side mutation validator and the
 // client-side render layer.
 export function scanMarkerIds(state: CollabState): Set<string> {
-  const result = new Set<string>();
+  return scanMarkerIdsDetailed(state).charKeys;
+}
+
+// Like `scanMarkerIds`, but additionally returns a per-char "run id" so callers
+// can distinguish between two adjacent (back-to-back) marker runs. Required by
+// `validateMutationAgainstMarkers` to correctly classify boundary inserts
+// between two consecutive marker runs.
+export function scanMarkerIdsDetailed(state: CollabState): MarkerScan {
+  const charKeys = new Set<string>();
+  const runIds = new Map<string, number>();
   const ids: ElementId[] = [];
   const text: string[] = [];
   for (const id of state.idList.values()) {
@@ -228,14 +243,21 @@ export function scanMarkerIds(state: CollabState): Set<string> {
     }
   }
   const joined = text.join("");
-  const re = /<!--\s*@path:[^]*?-->/g;
+  // Confine the non-greedy match to a single line and disallow `>` inside the
+  // path payload. Confluence-adf renders markers on their own line, so this is
+  // safe and prevents pathological renders from creating phantom markers.
+  const re = /<!--\s*@path:[^>\n]*?-->/g;
   let match: RegExpExecArray | null;
+  let runIndex = 0;
   while ((match = re.exec(joined)) !== null) {
     for (let i = match.index; i < match.index + match[0].length; i++) {
-      result.add(charKey(ids[i]));
+      const k = charKey(ids[i]);
+      charKeys.add(k);
+      runIds.set(k, runIndex);
     }
+    runIndex++;
   }
-  return result;
+  return { charKeys, runIds };
 }
 
 // Build the marker-stripped visible projection together with a mapping from
@@ -281,9 +303,13 @@ export type MarkerValidationResult =
 export function validateMutationAgainstMarkers(
   state: CollabState,
   mutation: ClientMutation,
-  markerIds: Set<string>,
+  markerIds: Set<string> | MarkerScan,
 ): MarkerValidationResult {
-  if (markerIds.size === 0) return { ok: true };
+  const scan: MarkerScan = markerIds instanceof Set
+    ? { charKeys: markerIds, runIds: new Map() }
+    : markerIds;
+  const charKeys = scan.charKeys;
+  if (charKeys.size === 0) return { ok: true };
 
   if (mutation.name === "insert") {
     if (typeof mutation.args.content === "string" && mutation.args.content.includes(MARKER_OPEN_LITERAL)) {
@@ -293,7 +319,7 @@ export function validateMutationAgainstMarkers(
     if (before === null) return { ok: true };
     if (!state.idList.isKnown(before) || !state.idList.has(before)) return { ok: true };
     const beforeKey = charKey(before);
-    if (!markerIds.has(beforeKey)) return { ok: true };
+    if (!charKeys.has(beforeKey)) return { ok: true };
     // `before` is inside a marker run. Find the next live id and check if it
     // also belongs to the same marker (i.e. we are strictly inside).
     let beforeIndex: number;
@@ -303,15 +329,23 @@ export function validateMutationAgainstMarkers(
       return { ok: true };
     }
     if (beforeIndex < 0) return { ok: true };
-    const total = visibleLength(state);
+    const total = state.idList.length;
     if (beforeIndex + 1 >= total) {
       // Marker is at the very end of the document — boundary insert allowed.
       return { ok: true };
     }
     const nextId = state.idList.at(beforeIndex + 1);
     const nextKey = charKey(nextId);
-    if (!markerIds.has(nextKey)) {
+    if (!charKeys.has(nextKey)) {
       // Next char is outside any marker → insert at run boundary, allow.
+      return { ok: true };
+    }
+    // Both `before` and `next` belong to a marker run. If they belong to
+    // DIFFERENT runs (back-to-back markers), this is a legitimate boundary
+    // insert between two adjacent runs and must be allowed.
+    const beforeRun = scan.runIds.get(beforeKey);
+    const nextRun = scan.runIds.get(nextKey);
+    if (beforeRun !== undefined && nextRun !== undefined && beforeRun !== nextRun) {
       return { ok: true };
     }
     return { ok: false, reason: "insert-inside-marker", markerCharKey: beforeKey };
@@ -341,20 +375,20 @@ export function validateMutationAgainstMarkers(
   }
   if (endIndex < startIndex) return { ok: true };
 
-  const visibleTotal = visibleLength(state);
+  const visibleTotal = state.idList.length;
   // Walk all chars in [startIndex, endIndex]. For each marker run that
   // overlaps the range, ensure the entire run is contained in the range.
   for (let i = startIndex; i <= endIndex && i < visibleTotal; i++) {
     const key = charKey(state.idList.at(i));
-    if (!markerIds.has(key)) continue;
+    if (!charKeys.has(key)) continue;
     // Walk the marker run forward and backward from i; the entire run must
     // lie within [startIndex, endIndex].
     let runStart = i;
-    while (runStart > 0 && markerIds.has(charKey(state.idList.at(runStart - 1)))) {
+    while (runStart > 0 && charKeys.has(charKey(state.idList.at(runStart - 1)))) {
       runStart--;
     }
     let runEnd = i;
-    while (runEnd + 1 < visibleTotal && markerIds.has(charKey(state.idList.at(runEnd + 1)))) {
+    while (runEnd + 1 < visibleTotal && charKeys.has(charKey(state.idList.at(runEnd + 1)))) {
       runEnd++;
     }
     if (runStart < startIndex || runEnd > endIndex) {
@@ -364,12 +398,6 @@ export function validateMutationAgainstMarkers(
     i = runEnd;
   }
   return { ok: true };
-}
-
-function visibleLength(state: CollabState): number {
-  let n = 0;
-  for (const _ of state.idList.values()) n++;
-  return n;
 }
 
 export function newCollabState(): CollabState {

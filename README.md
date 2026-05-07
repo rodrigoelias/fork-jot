@@ -140,6 +140,21 @@ Share endpoints (no auth, access controlled by `shareAccess`):
 | POST   | `/api/share/:sid/threads/:tid/replies` | Reply                          |
 | POST   | `/api/share/:sid/render`               | Render markdown to HTML        |
 
+### Note response shape
+
+Confluence-bound notes include a `confluence` field on the note body returned
+by `GET /api/notes/:id` and `GET /api/share/:sid/note`:
+
+```
+confluence: {
+  pageId, baseUrl,
+  lastKnownPublishedVersion, lastKnownDraftVersion,
+  lastPushedAt, lastPushStatus, lastPushError,
+  agentEditsAllowed, agentCommentsAllowed,
+  hasUnpushedEdits,
+} | null
+```
+
 ## Confluence-backed notes
 
 A jot note can be **bound to a Confluence page**. The collab buffer holds
@@ -237,9 +252,30 @@ marker return `409 marker-conflict` with the offending marker key echoed.
 | POST   | `/api/notes/:id/confluence/refresh`     | Pull from Confluence              |
 | PATCH  | `/api/notes/:id/confluence`             | Toggle agent gates (audit-logged) |
 
-These endpoints all require an owner **session cookie**; an owner API key is
-not sufficient. This is deliberate — destructive Confluence-side actions are
-human-in-the-loop only.
+These endpoints accept either an owner session cookie or an owner API key.
+The `?annotated=1` flag on `GET /api/notes/:id` and the agent gate on
+`/edit` and `/threads` (see "Owner-opt-in" above) remain cookie-session-only
+— those distinguish "human owner in the browser" from "API-key-bearing
+agent" for buffer-mutation paths.
+
+**Publish response shape**:
+
+Success (200):
+  { ok: true, confluence: {...}, result: {
+    type: "confluence-push", noteId, pageId, status: "pushed",
+    appliedCount, oldVersion, newVersion, lastPushedAt
+  }}
+
+Conflict (409, errorKind ∈ {fetch-conflict, draft-conflict}) or
+  Crash/Config (502, errorKind ∈ {crash, config}):
+  { ok: false, confluence: {...}, result: {
+    type: "confluence-push", noteId, pageId, status: "conflict" | "error",
+    errorKind, errorMessage
+  }}
+
+The same `result` shape is broadcast over WebSocket as `confluence-push`
+status updates. Pollers can rely on `GET /api/notes/:id/confluence/status`
+or watch the WS stream.
 
 ### CLI helpers
 
